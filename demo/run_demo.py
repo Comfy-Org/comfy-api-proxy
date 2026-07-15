@@ -8,6 +8,7 @@ Usage:
 Only --base (and --key for cloud) change between surfaces; nothing else does.
 That is the whole point of the one-contract design.
 """
+
 from __future__ import annotations
 
 import argparse
