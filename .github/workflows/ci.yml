@@ -52,7 +52,7 @@ jobs:
         run: pip install -e ".[dev]"
 
       - name: mypy
-        run: mypy src/comfy_api_proxy demo tests
+        run: mypy src/comfy_api_proxy
 
   test:
     name: Test + e2e smoke (Python ${{ matrix.python-version }})

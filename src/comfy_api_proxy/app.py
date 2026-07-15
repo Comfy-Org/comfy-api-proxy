@@ -9,6 +9,7 @@ Design notes grounded in the plan and verified against ComfyUI master:
   * Job status is served by plain polling — the first-iteration "poll-first"
     path. The live-progress stream is a later milestone.
 """
+
 from __future__ import annotations
 
 import base64
@@ -112,7 +113,9 @@ class Proxy:
                 for it in items:
                     if not isinstance(it, dict) or "filename" not in it:
                         continue
-                    aid = _asset_id(it["filename"], it.get("subfolder", ""), it.get("type", "output"))
+                    aid = _asset_id(
+                        it["filename"], it.get("subfolder", ""), it.get("type", "output")
+                    )
                     out.append(
                         {
                             "node_id": node_id,

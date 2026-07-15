@@ -3,6 +3,7 @@ without a GPU. Implements the handful of endpoints the proxy calls:
 /prompt, /history/{id}, /queue, /view. A submitted job "completes" instantly
 with one PNG output.
 """
+
 from __future__ import annotations
 
 from aiohttp import web
