@@ -1,7 +1,7 @@
 """Command-line entry point: ``comfy-api-proxy --comfyui URL --port N``.
 
-Binds to 127.0.0.1 by default (the safe default the security review requires;
-widening the bind address and requiring a token are follow-up work).
+Binds to 127.0.0.1 by default (the safe default; widening the bind address and
+requiring a token are follow-up work).
 """
 
 from __future__ import annotations

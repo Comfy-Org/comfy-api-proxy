@@ -2,7 +2,7 @@
 
 Demo scope (first iteration slice): submit a workflow, poll job status, and
 download outputs. No file upload, no live-progress stream, no idempotency yet —
-those follow per docs/sdk/plan.md.
+those follow in later iterations.
 """
 
 __version__ = "0.0.1"

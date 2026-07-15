@@ -1,6 +1,6 @@
 """The proxy application: Comfy API v2 (demo subset) over a single ComfyUI.
 
-Design notes grounded in the plan and verified against ComfyUI master:
+Design notes (verified against the ComfyUI HTTP/WebSocket API):
   * The proxy mints each job's id and passes it to ComfyUI as ``prompt_id``.
     ComfyUI accepts a client-supplied canonical UUID, so history lookups are 1:1.
   * ComfyUI's history and its ``/api/jobs`` endpoint are the SAME in-memory
