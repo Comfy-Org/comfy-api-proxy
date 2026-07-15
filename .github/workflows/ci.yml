@@ -78,9 +78,8 @@ jobs:
       # tests/test_smoke.py drives the proxy directly over its own HTTP
       # surface (submit -> poll -> download) using only the standard library
       # (urllib) - no SDK, no other repo's credentials, no network dependency
-      # beyond localhost. demo/run_demo.py (which does use the real Comfy
-      # Python SDK from the separate, private Comfy-Org/ComfyPythonSDK repo)
-      # is the human-facing demo and is intentionally not exercised here, so
-      # this repo's CI never depends on another repo's access token.
+      # beyond localhost. demo/run_demo.py (which uses the separate comfy-sdk
+      # package) is the human-facing demo and is intentionally not exercised
+      # here, so this repo's CI never depends on another repo's access token.
       - name: Run tests (includes the end-to-end smoke test)
         run: pytest -v
