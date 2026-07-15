@@ -75,32 +75,12 @@ jobs:
       - name: Install package + dev tools
         run: pip install -e ".[dev]"
 
-      # demo/run_demo.py (driven by tests/test_smoke.py) talks to the proxy
-      # through the real Comfy Python SDK client, not a hand-rolled HTTP call -
-      # that SDK lives in the private Comfy-Org/ComfyPythonSDK repo, so it has
-      # to be installed explicitly here rather than pulled in as a normal
-      # dependency.
-      #
-      # Requires a repo secret named COMFY_PYTHON_SDK_TOKEN: a fine-grained
-      # GitHub personal access token (or GitHub App installation token) with
-      # read-only "Contents" access to Comfy-Org/ComfyPythonSDK. The default
-      # GITHUB_TOKEN cannot read a different private repo, even in the same
-      # org, so this secret must be added by someone with admin access to
-      # this repo's settings before this job can pass.
-      #
-      # Pinned to the feat/demo-client branch because that is the only ref
-      # with real code today (main is still a stub) - move this to main once
-      # https://github.com/Comfy-Org/ComfyPythonSDK/pull/1 merges.
-      - name: Install Comfy Python SDK (private, for the e2e smoke test)
-        env:
-          SDK_CHECKOUT_TOKEN: ${{ secrets.COMFY_PYTHON_SDK_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [ -z "${SDK_CHECKOUT_TOKEN:-}" ]; then
-            echo "::error::Missing repo secret COMFY_PYTHON_SDK_TOKEN, needed to install the private Comfy-Org/ComfyPythonSDK package that the e2e smoke test uses. Add a fine-grained PAT with read-only Contents access to that repo as a secret named COMFY_PYTHON_SDK_TOKEN in this repo's settings."
-            exit 1
-          fi
-          pip install "git+https://x-access-token:${SDK_CHECKOUT_TOKEN}@github.com/Comfy-Org/ComfyPythonSDK.git@feat/demo-client"
-
+      # tests/test_smoke.py drives the proxy directly over its own HTTP
+      # surface (submit -> poll -> download) using only the standard library
+      # (urllib) - no SDK, no other repo's credentials, no network dependency
+      # beyond localhost. demo/run_demo.py (which does use the real Comfy
+      # Python SDK from the separate, private Comfy-Org/ComfyPythonSDK repo)
+      # is the human-facing demo and is intentionally not exercised here, so
+      # this repo's CI never depends on another repo's access token.
       - name: Run tests (includes the end-to-end smoke test)
         run: pytest -v
