@@ -2,8 +2,7 @@
 
 A local service that puts the **Comfy API v2** in front of a self-hosted ComfyUI
 instance, so the same SDK code that talks to Comfy Cloud also drives a ComfyUI on
-your own machine. One of the three surfaces in `docs/sdk/plan.md` (alongside Comfy
-Cloud's `public-api` and the serverless gateway).
+your own machine.
 
 Python + aiohttp — the same stack as ComfyUI core, so the adapter can later move
 into core itself.
@@ -27,7 +26,7 @@ python demo/run_demo.py                # submit → wait → download
 
 ## Scope
 
-First-iteration demo slice: submit a workflow, poll job status, download outputs.
-Not yet here (see the plan): file upload, the live-progress stream, idempotency, a
-durable job store, and the resilient WebSocket client for progress. This slice
-serves job status by plain polling.
+First-iteration slice: submit a workflow, poll job status, download outputs.
+Not yet here: file upload, the live-progress stream, idempotency, a durable job
+store, and the resilient WebSocket client for progress. This slice serves job
+status by plain polling.
