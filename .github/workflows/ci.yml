@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint & format (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package + dev tools
+        run: pip install -e ".[dev]"
+
+      - name: ruff check (lint)
+        run: ruff check .
+
+      - name: ruff format --check
+        run: ruff format --check .
+
+  typecheck:
+    name: Type-check (mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package + dev tools
+        run: pip install -e ".[dev]"
+
+      - name: mypy
+        run: mypy src/comfy_api_proxy demo tests
+
+  test:
+    name: Test + e2e smoke (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install package + dev tools
+        run: pip install -e ".[dev]"
+
+      # demo/run_demo.py (driven by tests/test_smoke.py) talks to the proxy
+      # through the real Comfy Python SDK client, not a hand-rolled HTTP call -
+      # that SDK lives in the private Comfy-Org/ComfyPythonSDK repo, so it has
+      # to be installed explicitly here rather than pulled in as a normal
+      # dependency.
+      #
+      # Requires a repo secret named COMFY_PYTHON_SDK_TOKEN: a fine-grained
+      # GitHub personal access token (or GitHub App installation token) with
+      # read-only "Contents" access to Comfy-Org/ComfyPythonSDK. The default
+      # GITHUB_TOKEN cannot read a different private repo, even in the same
+      # org, so this secret must be added by someone with admin access to
+      # this repo's settings before this job can pass.
+      #
+      # Pinned to the feat/demo-client branch because that is the only ref
+      # with real code today (main is still a stub) - move this to main once
+      # https://github.com/Comfy-Org/ComfyPythonSDK/pull/1 merges.
+      - name: Install Comfy Python SDK (private, for the e2e smoke test)
+        env:
+          SDK_CHECKOUT_TOKEN: ${{ secrets.COMFY_PYTHON_SDK_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SDK_CHECKOUT_TOKEN:-}" ]; then
+            echo "::error::Missing repo secret COMFY_PYTHON_SDK_TOKEN, needed to install the private Comfy-Org/ComfyPythonSDK package that the e2e smoke test uses. Add a fine-grained PAT with read-only Contents access to that repo as a secret named COMFY_PYTHON_SDK_TOKEN in this repo's settings."
+            exit 1
+          fi
+          pip install "git+https://x-access-token:${SDK_CHECKOUT_TOKEN}@github.com/Comfy-Org/ComfyPythonSDK.git@feat/demo-client"
+
+      - name: Run tests (includes the end-to-end smoke test)
+        run: pytest -v
