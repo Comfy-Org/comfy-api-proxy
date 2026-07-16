@@ -36,12 +36,13 @@ def main() -> int:
 
     client = Comfy(args.base, api_key=args.key)
     print(f"→ running a workflow against {args.base}")
-    job = client.run(WORKFLOW)
-    print(f"  job {job['id']} → {job['status']}, {len(job['outputs'])} output(s)")
-    for out in job["outputs"]:
-        path = client.download(out, args.out)
+    wf = client.workflows.from_json(WORKFLOW)
+    job = client.run(wf)
+    print(f"  job {job.id} → {job.status}, {len(job.outputs)} output(s)")
+    for out in job.outputs:
+        path = out.to_file(args.out)
         size = Path(path).stat().st_size
-        print(f"  downloaded {out['type']} '{out['name']}' → {path} ({size} bytes)")
+        print(f"  downloaded {out.type} '{out.name}' → {path} ({size} bytes)")
     print("✓ done")
     return 0
 
