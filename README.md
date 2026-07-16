@@ -3,15 +3,73 @@
 [![CI](https://github.com/Comfy-Org/comfy-api-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/Comfy-Org/comfy-api-proxy/actions/workflows/ci.yml)
 
 A local service that puts the **Comfy API v2** in front of a self-hosted ComfyUI
-instance, so the same SDK code that talks to Comfy Cloud also drives a ComfyUI on
-your own machine.
+instance. The same client SDK code that talks to Comfy Cloud can drive a
+ComfyUI on your own machine instead — and, since this proxy is Python +
+aiohttp (the same stack as ComfyUI core), the same adapter can later move
+*into* core itself. That's the "one contract, three surfaces" idea: Comfy
+Cloud, this proxy, and (eventually) ComfyUI core all speak the same `/api/v2/`
+shape, so integrator code doesn't need to fork depending on where it's
+pointed.
 
-Python + aiohttp — the same stack as ComfyUI core, so the adapter can later move
-into core itself.
+## Requirements & install
 
-## Capabilities
+- Python **3.10+** (CI runs 3.10, 3.11, and 3.12 on every pull request).
+- Not yet published to PyPI — install from a checkout:
 
-The full `/api/v2/` surface, wrapping ComfyUI's native HTTP + WebSocket API:
+  ```bash
+  git clone https://github.com/Comfy-Org/comfy-api-proxy
+  cd comfy-api-proxy
+  pip install -e .
+  ```
+
+## Quickstart
+
+### Against a real ComfyUI
+
+Point the proxy at an already-running ComfyUI and it serves `/api/v2/*` on
+its own port:
+
+```bash
+pip install -e .
+comfy-api-proxy --comfyui http://127.0.0.1:8188 --port 8189
+
+# co-located with ComfyUI, to also enable model-directory uploads:
+comfy-api-proxy --comfyui http://127.0.0.1:8188 --port 8189 \
+  --comfyui-base-dir /path/to/ComfyUI
+```
+
+### No-GPU demo
+
+`demo/fake_comfyui.py` is a stand-in ComfyUI — just enough of the native
+`/prompt` / `/history` / `/queue` / `/view` / `/ws` surface to run a workflow
+end to end without a GPU (or ComfyUI installed at all):
+
+```bash
+python demo/fake_comfyui.py &          # a stand-in ComfyUI on :8188
+comfy-api-proxy &                      # the proxy on :8189
+python demo/run_demo.py                # submit → wait → download
+```
+
+`demo/run_demo.py` drives the proxy through the real Python SDK
+(`comfy_sdk.Comfy`) — the same client code you'd point at Comfy Cloud — and
+imports it from a sibling checkout, so clone the SDK repo (see
+[SDKs and the API contract](#sdks-and-the-api-contract) below) next to this
+one before running the demo:
+
+```
+some-parent-dir/
+├── comfy-api-proxy/   (this repo)
+└── ComfyPythonSDK/
+```
+
+CI never depends on that checkout being present: the test suite
+(`tests/test_smoke.py`) drives the proxy's own HTTP surface directly with
+only the standard library, so `pytest` works with nothing but this repo
+installed.
+
+## The `/api/v2/` surface
+
+Wraps ComfyUI's native HTTP + WebSocket API one-to-one:
 
 | v2 operation | Backed by |
 |---|---|
@@ -23,8 +81,12 @@ The full `/api/v2/` surface, wrapping ComfyUI's native HTTP + WebSocket API:
 | `POST /api/v2/assets/from-hash`, `HEAD /api/v2/assets/by-hash/{hash}` | Local hash index |
 | `GET /api/v2/assets/{id}`, `GET /api/v2/assets/{id}/content` | Local index / ComfyUI `/view`, Range-capable |
 
-Poll-first, same as the canonical contract: `GET /api/v2/jobs/{id}` is always
-the source of truth; the SSE stream is a live convenience on top of it.
+**Poll-first, same as the canonical contract:** `GET /api/v2/jobs/{id}` is
+always the source of truth for a job's state; the SSE stream
+(`GET /api/v2/jobs/{id}/events`) is a live convenience layered on top of
+it — a client that never opens it still sees the same state by polling. See
+[Live events (SSE)](#live-events-sse) below for what the stream carries and
+its concurrent-connection limit.
 
 ### Model-file uploads (`checkpoints/`, `loras/`, `vae/`, ...)
 
@@ -52,75 +114,117 @@ touches disk:
   destination, so two uploads can never race into a torn or silently
   overwritten file.
 
+Once placed, the asset's `file_path` — and the value substituted for any
+`core/ASSET` reference to it in a submitted workflow — is the filename
+**relative to the model-root directory** (e.g. `my_model.safetensors`, not
+`checkpoints/my_model.safetensors`). That matches how ComfyUI's own combo
+widgets/loaders reference a model internally; a category-qualified path
+would be rejected as an unknown filename.
+
 ### Live events (SSE)
 
 `GET /api/v2/jobs/{id}/events` opens one WebSocket connection to ComfyUI,
 performs its `feature_flags` handshake, and translates the native
 `progress`/`progress_state`/preview/terminal messages into the v2 SSE event
-catalog (`status`, `progress`, `preview`, `output`). If ComfyUI's WebSocket
-is unreachable, the stream falls back to polling `/history` so it still
-resolves to an authoritative terminal `status` rather than failing outright.
+catalog (`status`, `progress`, `preview`, `output`), throttled to ~2
+progress/preview events per second. If ComfyUI's WebSocket is unreachable,
+the stream falls back to polling `/history` so it still resolves to an
+authoritative terminal `status` rather than failing outright.
+
+A proxy instance also caps concurrent event streams (8 by default, since
+each one holds open a ComfyUI WebSocket connection). Past that limit, a new
+stream request gets `429 too_many_streams` with a `Retry-After` hint instead
+of queuing or degrading — `GET /api/v2/jobs/{id}` polling is always
+available regardless, and a slot frees up as soon as the stream it belongs
+to ends (the job finishes, or the client disconnects).
 
 ### Security defaults
 
-- Binds to `127.0.0.1` only by default. Widening `--host` to a non-loopback
-  address is refused unless `--token` is set (or `--allow-insecure-bind` is
-  passed to explicitly opt out of that guard).
-- A default-on origin-check middleware — ported from ComfyUI core's own
-  `create_origin_only_middleware` — rejects cross-site browser requests
-  even when nothing else is configured.
-- An optional static bearer token (`--token`) gates all of `/api/v2/*`.
+Everything here is on by default — no flags needed to get to the safe
+configuration:
 
-## Run
+- **Binds to `127.0.0.1` only.** Widening `--host` to a non-loopback address
+  is refused (the process exits with an error) unless `--token` is set, or
+  `--allow-insecure-bind` is passed to explicitly opt out of that guard.
+- **An optional static bearer token** (`--token`) gates all of `/api/v2/*`
+  when configured; unset by default, since a self-hosted single-user
+  ComfyUI usually has nothing to authenticate against.
+- **A default-on origin-check middleware** — ported from ComfyUI core's own
+  `create_origin_only_middleware` — rejects cross-site browser requests even
+  when nothing else is configured, closing the DNS-rebinding / drive-by-CSRF
+  hole any unauthenticated localhost server is exposed to.
+- **Model-file uploads are safetensors-only, with path-traversal and
+  symlink-escape guards** (see *Model-file uploads* above) — and are
+  rejected outright unless the proxy was started co-located with
+  `--comfyui-base-dir`.
+
+## CLI reference
 
 ```bash
-pip install -e .
-comfy-api-proxy --comfyui http://127.0.0.1:8188 --port 8189
-
-# co-located with ComfyUI, to also enable model-directory uploads:
-comfy-api-proxy --comfyui http://127.0.0.1:8188 --port 8189 \
-  --comfyui-base-dir /path/to/ComfyUI
+comfy-api-proxy --comfyui http://127.0.0.1:8188 --port 8189 [options]
 ```
 
-## Demo (no GPU needed)
+| Flag | Default | What it does |
+|---|---|---|
+| `--comfyui` | `http://127.0.0.1:8188` | Base URL of the self-hosted ComfyUI to proxy. |
+| `--host` | `127.0.0.1` | Address to bind. Widening past loopback requires `--token` or `--allow-insecure-bind` (see [Security defaults](#security-defaults)). |
+| `--port` | `8189` | Port to serve the v2 API on. |
+| `--token` | *(unset)* | Require `Authorization: Bearer <token>` on every `/api/v2/*` request. |
+| `--comfyui-base-dir` | *(unset)* | Filesystem root of a co-located ComfyUI install. Required to enable direct model-directory placement of model-file uploads; without it, model uploads are rejected (workflow-input uploads still work). |
+| `--max-upload-mb` | `100` | Max single-request upload size, in MB. |
+| `--allow-insecure-bind` | `false` | Permit binding a non-loopback `--host` without a `--token`. Unsafe — exposes an unauthenticated proxy to the network. |
 
-```bash
-python demo/fake_comfyui.py &          # a stand-in ComfyUI on :8188
-comfy-api-proxy &                      # the proxy on :8189
-python demo/run_demo.py                # submit → wait → download
-```
+## SDKs and the API contract
 
-## The vendored API contract (`spec/`)
+Any real integration — and `demo/run_demo.py` — uses the same client SDKs
+Comfy Cloud users use, just pointed at this proxy's `--host:--port` instead
+of `api.comfy.org` / `cloud.comfy.org`:
 
-`spec/openapi.yaml` is a synced, filtered copy of the canonical Comfy API v2
-contract that lives in the Comfy Org `cloud` monorepo — filtered because that
-source repo is private and this one is public. It flows **one way**
-(cloud → here) via a sync workflow; never hand-edit it. See `spec/README.md`
-for what "filtered" means, `docs/sync-workflow.md` for the sync design, and
-`scripts/sync-spec.sh` / `scripts/generate_models.py` for the tooling that
-performs it. Pydantic models generated from the spec live at
-`src/comfy_api_proxy/schemas/_generated.py` and are used only in tests (see
-`tests/test_schema_conformance.py`) to check real handler responses against
-the contract — never on the request-handling hot path.
+- [ComfyPythonSDK](https://github.com/Comfy-Org/ComfyPythonSDK)
+- [ComfyTypeScriptSDK](https://github.com/Comfy-Org/ComfyTypeScriptSDK)
 
-## Contributing
+`spec/openapi.yaml` in this repo is a synced, filtered copy of that same
+Comfy API v2 contract — see `spec/README.md` for what "filtered" means, and
+[Development](#development) below for how it's kept in sync.
+
+## Development
 
 ```bash
 pip install -e ".[dev]"
 ruff check .            # lint
 ruff format --check .   # format check
-mypy src/comfy_api_proxy demo tests   # type-check (lenient - see pyproject.toml)
+mypy src/comfy_api_proxy   # type-check (lenient - see pyproject.toml)
 pytest -v                # unit + end-to-end tests
 python3 scripts/generate_models.py && git diff --exit-code src/comfy_api_proxy/schemas/_generated.py
                           # spec-drift check (also runs in CI)
 ```
 
+These are exactly the checks CI runs (`.github/workflows/ci.yml`), each as
+its own job — lint/format, type-check, spec-drift, and test — with the test
+job running across Python 3.10, 3.11, and 3.12.
+
 `tests/test_smoke.py` and `tests/test_endpoints.py` start the fake ComfyUI
 stand-in and the real proxy as subprocesses and drive both over plain HTTP
 (standard library only — no SDK, no third-party client, no dependency on
 another repo's credentials), covering upload → core/ASSET-reference →
-run → download, cancel, from-hash/by-hash, and the SSE stream. The same
-checks CI runs on every pull request, across Python 3.10, 3.11, and 3.12.
+run → download, cancel, from-hash/by-hash, the SSE stream (including its
+concurrent-stream cap), and the model-placement security guards.
+
+### Keeping `spec/openapi.yaml` in sync
+
+The vendored spec is **generated, one-way (upstream → here), and never
+hand-edited**. `scripts/sync-spec.sh` fetches the canonical spec from
+wherever it's passed (a local path or a URL), runs it through
+`scripts/filter_openapi.py` — which strips anything internal-only before a
+byte lands in this public repo — and writes the result to `spec/openapi.yaml`
+plus a `spec/VERSION` provenance pin. `scripts/generate_models.py` then
+regenerates the pydantic models (`src/comfy_api_proxy/schemas/_generated.py`)
+that `tests/test_schema_conformance.py` validates real handler responses
+against — those models are used only in tests, never on the
+request-handling hot path. CI's `spec-drift` job re-runs the generator and
+fails the build if the checked-in models don't match, so a spec sync without
+a regeneration gets caught immediately instead of drifting silently. See
+`spec/README.md` and `docs/sync-workflow.md` for the full design.
 
 ## Scope
 

@@ -9,10 +9,15 @@ Stdlib-only HTTP (see conftest.Stack); no SDK, no third-party client.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import struct
 import threading
 import time
+import urllib.request
+from datetime import datetime, timedelta, timezone
+
+from comfy_api_proxy.app import _MAX_CONCURRENT_STREAMS
 
 # A 1x1 PNG, same bytes the fake serves — content the proxy hashes for dedup.
 _PNG = bytes.fromhex(
@@ -419,3 +424,171 @@ def test_model_asset_ref_resolves_to_root_relative_filename(stack_with_models_di
     # is root-relative rather than category-qualified — the resolution step
     # this regression is about, distinct from what a real ComfyUI does with it.
     assert status == 201, raw
+
+
+# ---------------------------------------------------------------------------
+# 422 mapping: reserved top-level fields and a missing 'workflow' key.
+#
+# test_reserved_fields_rejected (above) only exercises 'webhook_url'; submit()
+# rejects 'inputs' the same way (it isn't accepted until the not-yet-built
+# Idempotency-Key / replay path exists), and a request with no 'workflow' key
+# at all is a distinct code path from both the reserved-field check and the
+# UI-format-graph check.
+# ---------------------------------------------------------------------------
+def test_submit_reserved_inputs_field_rejected(stack):
+    status, body, raw = stack.request(
+        "POST", "/api/v2/jobs", {"workflow": {"1": {}}, "inputs": {"foo": "bar"}}
+    )
+    assert status == 422, raw
+    assert body["error"]["code"] == "invalid_workflow"
+
+
+def test_submit_missing_workflow_key_rejected(stack):
+    status, body, raw = stack.request("POST", "/api/v2/jobs", {})
+    assert status == 422, raw
+    assert body["error"]["code"] == "invalid_workflow"
+
+
+# ---------------------------------------------------------------------------
+# Cancel of an already-terminal job must be a harmless no-op: cancel_job()
+# calls ComfyUI's cancel unconditionally when the job is known to the proxy,
+# then only overrides the status to "canceling" if the post-cancel state is
+# "running". A succeeded job must come back unchanged, not corrupted into
+# "canceling" or an error.
+# ---------------------------------------------------------------------------
+def test_cancel_of_already_succeeded_job_is_idempotent(stack):
+    workflow = {"9": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}}}
+    _, job, raw = stack.request("POST", "/api/v2/jobs", {"workflow": workflow})
+    assert job.get("id"), raw
+    job = _poll_until_terminal(stack, job)
+    assert job["status"] == "succeeded", job
+
+    status, body, raw = stack.request("POST", job["urls"]["cancel"])
+    assert status == 200, raw
+    assert body["status"] == "succeeded", body
+
+
+# ---------------------------------------------------------------------------
+# Retention shape: Job.expires_at and Asset.url_expires_at are contractual
+# fields (required by spec/openapi.yaml), but schema-conformance only checks
+# that they parse as a date-time — not that they carry the actual 24h
+# retention window the README documents. Lock in the real duration so a
+# change to _RETENTION (app.py) or a broken computation is caught here.
+# ---------------------------------------------------------------------------
+def test_job_expires_at_is_24h_after_created_at(stack):
+    workflow = {"9": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}}}
+    status, job, raw = stack.request("POST", "/api/v2/jobs", {"workflow": workflow})
+    assert status == 201, raw
+    created = datetime.fromisoformat(job["created_at"])
+    expires = datetime.fromisoformat(job["expires_at"])
+    assert expires - created == timedelta(hours=24), (job["created_at"], job["expires_at"])
+
+
+def test_asset_url_expires_at_is_24h_out(stack):
+    before = datetime.now(timezone.utc)
+    status, asset, raw = stack.upload("cat.png", _PNG, "image/png")
+    after = datetime.now(timezone.utc)
+    assert status == 201, raw
+    expires = datetime.fromisoformat(asset["url_expires_at"])
+    assert before + timedelta(hours=24) <= expires <= after + timedelta(hours=24, minutes=1), (
+        before,
+        expires,
+        after,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Range requests: the existing test_content_range_request only checks that
+# *a* status in (200, 206) comes back. The fake always honors a Range header
+# with a 206, so the proxy's pass-through (app._stream_view) should too —
+# assert the deterministic outcome: the exact byte slice and the Content-Range
+# header the proxy relays from upstream, not just "didn't error."
+# ---------------------------------------------------------------------------
+def test_range_request_returns_exact_slice_and_content_range_header(stack):
+    _, asset, raw = stack.upload("cat.png", _PNG, "image/png")
+    req = urllib.request.Request(asset["url"], headers={"Range": "bytes=2-5"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        body = r.read()
+        assert r.status == 206, raw
+        assert r.headers.get("Content-Range") == f"bytes 2-5/{len(_PNG)}"
+        assert body == _PNG[2:6]
+
+
+# ---------------------------------------------------------------------------
+# Absolute-URL behavior: _external_base() (app.py) builds job/asset URLs from
+# request.scheme/request.host. make_app() wires no "trust the reverse proxy"
+# middleware, so those must reflect the connection the client actually used —
+# a client-supplied X-Forwarded-Host/-Proto must NOT be able to redirect the
+# URLs a caller is handed to an attacker-chosen origin.
+# ---------------------------------------------------------------------------
+def test_absolute_urls_ignore_client_supplied_forwarded_headers(stack):
+    workflow = {"9": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}}}
+    status, job, raw = stack.request(
+        "POST",
+        "/api/v2/jobs",
+        {"workflow": workflow},
+        headers={"X-Forwarded-Proto": "https", "X-Forwarded-Host": "evil.example"},
+    )
+    assert status == 201, raw
+    assert job["urls"]["self"] == f"{stack.base}/api/v2/jobs/{job['id']}"
+    assert "evil.example" not in json.dumps(job["urls"])
+
+    _, asset, raw = stack.upload("cat.png", _PNG, "image/png")
+    assert asset["url"].startswith(stack.base + "/"), raw
+
+
+# ---------------------------------------------------------------------------
+# Concurrent SSE stream cap (429 too_many_streams) and _open_streams
+# accounting. Regression target: a client opening more than
+# _MAX_CONCURRENT_STREAMS live event streams must be turned away with the
+# contract's dedicated code (not a generic error) and a Retry-After hint,
+# rather than the proxy accepting unbounded WS connections to ComfyUI. And
+# the counter must actually free a slot when a stream ends, or the proxy
+# would wedge itself into permanent 429s after any burst of clients.
+# ---------------------------------------------------------------------------
+def _open_sse_connection(url: str, timeout: float = 10.0):
+    """Open an SSE connection and return the raw response without reading its
+    body, so it keeps occupying one of the proxy's limited concurrent-stream
+    slots until the caller closes it (or the server ends the stream)."""
+    req = urllib.request.Request(url, method="GET")
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def test_sse_stream_cap_returns_429_and_frees_slot_when_job_finishes(stack):
+    workflow = {"1": {"class_type": "Noop", "inputs": {"hang": True}}}
+    _, job, raw = stack.request("POST", "/api/v2/jobs", {"workflow": workflow})
+    assert job.get("id"), raw
+    events_url = job["urls"]["events"]
+
+    opened = []
+    try:
+        for _ in range(_MAX_CONCURRENT_STREAMS):
+            resp = _open_sse_connection(events_url)
+            assert resp.status == 200
+            opened.append(resp)
+
+        # One more than the cap: the dedicated 429, not a generic failure —
+        # and Retry-After tells a well-behaved client when to try again
+        # instead of hammering the endpoint.
+        status, body, raw = stack.request("GET", events_url)
+        assert status == 429, raw
+        assert body["error"]["code"] == "too_many_streams"
+
+        # Finish the underlying job: every open bridge reaches its own
+        # terminal `status` event and ends its stream on its own, freeing
+        # every slot it held — without waiting out the (10s+) WS-timeout
+        # fallback path.
+        stack.request("POST", job["urls"]["cancel"])
+
+        deadline = time.monotonic() + 10.0
+        last = (None, None, None)
+        while time.monotonic() < deadline:
+            last = stack.request("GET", events_url)
+            if last[0] == 200:
+                break
+            time.sleep(0.2)
+        assert last[0] == 200, f"stream slot was never freed after job completion: {last}"
+    finally:
+        for resp in opened:
+            with contextlib.suppress(Exception):
+                resp.close()
