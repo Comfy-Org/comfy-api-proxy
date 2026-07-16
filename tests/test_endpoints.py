@@ -8,6 +8,8 @@ Stdlib-only HTTP (see conftest.Stack); no SDK, no third-party client.
 
 from __future__ import annotations
 
+import base64
+import json
 import struct
 import threading
 import time
@@ -242,3 +244,149 @@ def test_model_upload_rejects_non_safetensors(stack_with_models_dir):
     )
     assert status == 422, raw
     assert "safetensors" in body["error"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# Regression: path-traversal bypass of the model-placement guard.
+#
+# Before the fix, `input/../checkpoints/evil.safetensors` had
+# Path(...).parts[0] == "input", so the (then first-segment-only) model/input
+# classifier waved it through as "just an input upload" — a code path that
+# applied NO placement validation at all — letting the ".." ride along into
+# whatever ComfyUI's /upload/image did with the resulting subfolder string.
+# validate_upload_path (security.py) now runs once, on the whole path, before
+# that classification happens.
+# ---------------------------------------------------------------------------
+def test_dotdot_disguised_as_input_path_rejected(stack):
+    status, body, raw = stack.upload(
+        "input/../checkpoints/evil.safetensors", b"anything", "application/octet-stream"
+    )
+    assert status == 422, raw
+    assert body["error"]["code"] == "invalid_request"
+
+
+def test_dotdot_climbing_to_arbitrary_path_rejected(stack):
+    status, body, raw = stack.upload("input/../../etc/cron.d/pwn", b"malicious", "text/plain")
+    assert status == 422, raw
+    assert body["error"]["code"] == "invalid_request"
+
+
+def test_normal_paths_still_succeed_after_traversal_fix(stack_with_models_dir):
+    stack, _ = stack_with_models_dir
+    status, _, raw = stack.upload("input/foo.png", _PNG, "image/png")
+    assert status == 201, raw
+
+    header_json = b'{"w": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}'
+    data = struct.pack("<Q", len(header_json)) + header_json + b"\x00\x00\x00\x00"
+    status, _, raw = stack.upload("checkpoints/foo.safetensors", data, "application/octet-stream")
+    assert status == 201, raw
+
+
+# ---------------------------------------------------------------------------
+# Regression: forgeable stateless output asset ids.
+#
+# Before the fix, `_decode_asset_id` trusted any well-formed
+# `asset_<base64url(json)>` id — a hand-crafted one would let a client fetch
+# an arbitrary filename/subfolder via /view (through get_asset_content), or
+# splice an attacker-chosen path into a submitted workflow (through
+# _resolve_asset_ref, reached via a core/ASSET reference). The ids are now
+# HMAC-signed with a per-process secret and verified before use.
+# ---------------------------------------------------------------------------
+def test_forged_asset_id_rejected_by_content_fetch(stack):
+    raw_payload = json.dumps({"f": "out.png", "s": "", "t": "output"}).encode()
+    payload_b64 = base64.urlsafe_b64encode(raw_payload).decode().rstrip("=")
+    forged_id = f"asset_{payload_b64}.notarealsignature"
+
+    status, body, _ = stack.request("GET", f"/api/v2/assets/{forged_id}/content")
+    assert status == 404, body
+
+    status, body, _ = stack.request("GET", f"/api/v2/assets/{forged_id}")
+    assert status == 404, body
+
+
+def test_forged_asset_id_rejected_by_workflow_resolution(stack):
+    raw_payload = json.dumps({"f": "../../etc/passwd", "s": "", "t": "output"}).encode()
+    payload_b64 = base64.urlsafe_b64encode(raw_payload).decode().rstrip("=")
+    forged_id = f"asset_{payload_b64}.notarealsignature"
+
+    workflow = {
+        "1": {
+            "class_type": "LoadImage",
+            "inputs": {"image": {"__type": "core/ASSET", "info": {"id": forged_id}}},
+        }
+    }
+    status, body, raw = stack.request("POST", "/api/v2/jobs", {"workflow": workflow})
+    assert status == 422, raw
+    assert body["error"]["code"] == "missing_asset"
+
+
+def test_legitimately_minted_asset_id_round_trips(stack):
+    # A real job output mints its id via the proxy's own signing path
+    # (Proxy._asset_id) — it must still decode, both for content fetch and
+    # for core/ASSET resolution in a later submission.
+    workflow = {
+        "1": {"class_type": "Noop", "inputs": {}},
+        "9": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}},
+    }
+    status, job, raw = stack.request("POST", "/api/v2/jobs", {"workflow": workflow})
+    assert status == 201, raw
+    job = _poll_until_terminal(stack, job)
+    assert job["status"] == "succeeded", job.get("error")
+    assert job["outputs"], "no outputs"
+    legit_id = job["outputs"][0]["id"]
+    assert legit_id.startswith("asset_")
+
+    status, _, content = stack.request("GET", job["outputs"][0]["url"])
+    assert status == 200, content
+    assert content.startswith(b"\x89PNG\r\n\x1a\n")
+
+    status, meta, raw = stack.request("GET", f"/api/v2/assets/{legit_id}")
+    assert status == 200, raw
+
+    workflow2 = {
+        "1": {
+            "class_type": "LoadImage",
+            "inputs": {"image": {"__type": "core/ASSET", "info": {"id": legit_id}}},
+        },
+        "9": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}},
+    }
+    status, body, raw = stack.request("POST", "/api/v2/jobs", {"workflow": workflow2})
+    assert status == 201, raw
+
+
+# ---------------------------------------------------------------------------
+# Regression: model core/ASSET references resolving to the wrong filename.
+#
+# Before the fix, a model AssetRecord stored the ORIGINAL, category-qualified
+# file_path (e.g. "checkpoints/my_model.safetensors"), and _resolve_asset_ref
+# substituted it verbatim into the workflow. But ComfyUI's combo widgets
+# reference a model by its path RELATIVE TO the model-root directory (e.g.
+# just "my_model.safetensors") — folder_paths.get_filename_list() never
+# includes the category segment. The category-qualified value would be
+# rejected by ComfyUI as an unknown checkpoint name.
+# ---------------------------------------------------------------------------
+def test_model_asset_ref_resolves_to_root_relative_filename(stack_with_models_dir):
+    stack, base_dir = stack_with_models_dir
+    header_json = b'{"w": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}'
+    data = struct.pack("<Q", len(header_json)) + header_json + b"\x00\x00\x00\x00"
+    status, asset, raw = stack.upload(
+        "models/checkpoints/my_model.safetensors", data, "application/octet-stream"
+    )
+    assert status == 201, raw
+    # The asset's own file_path must already be root-relative (no leading
+    # "checkpoints/" segment) — this is what _resolve_asset_ref substitutes.
+    assert asset["file_path"] == "my_model.safetensors", asset
+
+    workflow = {
+        "1": {
+            "class_type": "CheckpointLoaderSimple",
+            "inputs": {"ckpt_name": {"__type": "core/ASSET", "info": {"id": asset["id"]}}},
+        },
+        "9": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}},
+    }
+    status, job, raw = stack.request("POST", "/api/v2/jobs", {"workflow": workflow})
+    # The fake ComfyUI doesn't itself validate the resolved value against a
+    # real model directory, but this proves the *value the proxy substitutes*
+    # is root-relative rather than category-qualified — the resolution step
+    # this regression is about, distinct from what a real ComfyUI does with it.
+    assert status == 201, raw

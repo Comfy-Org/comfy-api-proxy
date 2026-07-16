@@ -23,6 +23,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hashlib
+import hmac
 import json
 import mimetypes
 import os
@@ -38,11 +40,11 @@ from aiohttp import BodyPartReader, ClientSession, ClientTimeout, FormData, web
 from .assets import AssetRecord, AssetStore
 from .realtime import JobEventBridge
 from .security import (
-    MODEL_ROOTS,
     PlacementError,
     atomic_no_clobber_write,
     looks_like_safetensors,
     resolve_placement_path,
+    validate_upload_path,
 )
 
 # ---- ComfyUI output type -> our normalized output kind ---------------------
@@ -83,27 +85,8 @@ def _iso(dt: datetime) -> str:
     return dt.isoformat()
 
 
-def _asset_id(filename: str, subfolder: str, type_: str) -> str:
-    """Encode a ComfyUI file reference into a stateless, deterministic asset
-    id, so a job's outputs get stable ids across polls without a durable
-    store. Uploaded assets use random UUIDs (see assets.new_asset_id); the
-    two are told apart at read time by whether this decodes."""
-    raw = json.dumps({"f": filename, "s": subfolder, "t": type_}).encode()
-    return "asset_" + base64.urlsafe_b64encode(raw).decode().rstrip("=")
-
-
-def _decode_asset_id(asset_id: str) -> dict[str, str] | None:
-    if not asset_id.startswith("asset_"):
-        return None
-    b64 = asset_id[len("asset_") :]
-    pad = "=" * (-len(b64) % 4)
-    try:
-        ref = json.loads(base64.urlsafe_b64decode(b64 + pad))
-    except Exception:
-        return None
-    if isinstance(ref, dict) and {"f", "s", "t"} <= ref.keys():
-        return ref
-    return None
+def _b64url_decode(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
 
 def _is_ui_format(workflow: dict[str, Any]) -> bool:
@@ -137,10 +120,15 @@ class Proxy:
         self.base_dir = Path(comfyui_base_dir).resolve() if comfyui_base_dir else None
         self.max_upload_bytes = max_upload_bytes
         self.assets = AssetStore()
-        # job_id -> {"workflow": ..., "created_at": datetime}
+        # job_id -> {"workflow": ..., "created_at": datetime, "client_id": str}
         self._jobs: dict[str, dict[str, Any]] = {}
         self._session: ClientSession | None = None
         self._open_streams = 0
+        # Per-process secret used to HMAC-sign stateless output asset ids
+        # (see _asset_id / _decode_asset_id) — random per Proxy instance, so
+        # a restart invalidates ids from a prior process rather than
+        # reusing a fixed key. Never persisted, never logged.
+        self._asset_secret = os.urandom(32)
 
     # -- lifecycle -----------------------------------------------------------
     async def on_startup(self, app: web.Application) -> None:
@@ -154,6 +142,57 @@ class Proxy:
     def session(self) -> ClientSession:
         assert self._session is not None, "session not started"
         return self._session
+
+    # -- stateless output asset ids -------------------------------------------
+    def _asset_id(self, filename: str, subfolder: str, type_: str) -> str:
+        """Encode a ComfyUI file reference into a stateless, deterministic,
+        HMAC-signed asset id, so a job's outputs get stable ids across
+        polls without a durable store. Uploaded assets use random UUIDs
+        (see assets.new_asset_id); the two are told apart at read time by
+        whether this decodes.
+
+        The payload is signed with a per-process secret (see
+        ``self._asset_secret``) so a client cannot forge an id naming an
+        arbitrary filename/subfolder/type and have the proxy trust it —
+        without the signature check, a hand-crafted id would let a caller
+        read arbitrary files ComfyUI's ``/view`` can reach, or splice an
+        attacker-chosen path into a submitted workflow via
+        ``_resolve_asset_ref``.
+        """
+        raw = json.dumps({"f": filename, "s": subfolder, "t": type_}).encode()
+        payload_b64 = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+        tag = hmac.new(self._asset_secret, payload_b64.encode(), hashlib.sha256).digest()
+        tag_b64 = base64.urlsafe_b64encode(tag).decode().rstrip("=")
+        return f"asset_{payload_b64}.{tag_b64}"
+
+    def _decode_asset_id(self, asset_id: str) -> dict[str, str] | None:
+        """Decode + verify a stateless asset id minted by ``_asset_id``.
+
+        Returns ``None`` (treated as "unknown/not found" by every caller)
+        for anything that isn't a well-formed, correctly-signed id —
+        including a syntactically valid but forged one, closing the
+        "any well-formed asset_<...> id is trusted" gap.
+        """
+        if not asset_id.startswith("asset_"):
+            return None
+        rest = asset_id[len("asset_") :]
+        payload_b64, sep, tag_b64 = rest.partition(".")
+        if not sep:
+            return None
+        try:
+            given_tag = _b64url_decode(tag_b64)
+        except Exception:
+            return None
+        expected_tag = hmac.new(self._asset_secret, payload_b64.encode(), hashlib.sha256).digest()
+        if not hmac.compare_digest(expected_tag, given_tag):
+            return None
+        try:
+            ref = json.loads(_b64url_decode(payload_b64))
+        except Exception:
+            return None
+        if isinstance(ref, dict) and {"f", "s", "t"} <= ref.keys():
+            return ref
+        return None
 
     # -- upstream helpers ----------------------------------------------------
     async def _get_json(self, path: str) -> tuple[int, Any]:
@@ -217,7 +256,7 @@ class Proxy:
                 for it in items:
                     if not isinstance(it, dict) or "filename" not in it:
                         continue
-                    aid = _asset_id(
+                    aid = self._asset_id(
                         it["filename"], it.get("subfolder", ""), it.get("type", "output")
                     )
                     ctype = mimetypes.guess_type(it["filename"])[0] or "application/octet-stream"
@@ -289,7 +328,7 @@ class Proxy:
         if isinstance(asset_id, str):
             record = self.assets.get(asset_id)
             if record is None:
-                decoded = _decode_asset_id(asset_id)
+                decoded = self._decode_asset_id(asset_id)
                 if decoded is not None:
                     # A stateless output id used as an input — resolve to its
                     # filename directly (subfolder-qualified for /view semantics).
@@ -358,10 +397,20 @@ class Proxy:
             )
 
         job_id = "job_" + os.urandom(12).hex()
+        # A per-job client_id, not a fixed one shared by every submission.
+        # ComfyUI addresses progress/preview/executing/executed/
+        # execution_success/error/interrupted WS events at the client_id
+        # that SUBMITTED the prompt — it never broadcasts them. A shared
+        # fixed client_id means only whichever WS connection currently
+        # holds that name (if any) receives events for ANY job, so every
+        # other concurrent SSE stream (which connects with its own,
+        # different client_id) silently gets none. Using job_id itself as
+        # the client_id gives each job's own SSE bridge (see job_events,
+        # which connects with this same id) a 1:1 addressable target.
         payload = {
             "prompt": resolved_workflow,
             "prompt_id": job_id,
-            "client_id": "comfy-api-proxy",
+            "client_id": job_id,
         }
         async with self.session.post(self.comfyui + "/prompt", json=payload) as r:
             data = await r.json() if r.content_type == "application/json" else {}
@@ -369,7 +418,7 @@ class Proxy:
                 node_errors = data.get("node_errors") or {}
                 msg = (data.get("error") or {}).get("message", "Workflow rejected.")
                 return _error(422, "invalid_workflow", msg, node_errors=node_errors)
-        self._jobs[job_id] = {"workflow": workflow, "created_at": _now()}
+        self._jobs[job_id] = {"workflow": workflow, "created_at": _now(), "client_id": job_id}
         return web.json_response(self._job(job_id, {"status": "queued", "outputs": []}), status=201)
 
     async def get_job(self, request: web.Request) -> web.Response:
@@ -435,7 +484,15 @@ class Proxy:
                 "outputs": job["outputs"],
             }
 
-        bridge = JobEventBridge(self.comfyui, job_id, snapshot=snapshot, session=self.session)
+        # Connect the WS bridge with the SAME client_id the job was
+        # submitted under (see submit()), so ComfyUI's per-client-addressed
+        # events actually reach this connection. Fall back to job_id itself
+        # if the proxy has no record of the job (e.g. restarted) — that
+        # matches what submit() would have used anyway.
+        client_id = self._jobs.get(job_id, {}).get("client_id", job_id)
+        bridge = JobEventBridge(
+            self.comfyui, job_id, client_id=client_id, snapshot=snapshot, session=self.session
+        )
         self._open_streams += 1
         try:
             async for frame in bridge.stream():
@@ -503,6 +560,19 @@ class Proxy:
             file_path = fields.get("file_path")
             if not file_path:
                 return _error(422, "invalid_request", "Missing 'file_path'.")
+            # Validate + classify the path ONCE, before deciding which branch
+            # handles it (model-directory placement vs. plain input upload).
+            # This must happen before that decision, not after: a path like
+            # "input/../checkpoints/evil.safetensors" has parts[0] == "input",
+            # so a classifier that only looks at the first segment sends it
+            # down the (previously unvalidated) input branch, letting the
+            # ".." ride along into whatever that branch does with the raw
+            # string — completely skipping the model-placement guard. See
+            # security.validate_upload_path.
+            try:
+                is_model, norm_path = validate_upload_path(file_path)
+            except PlacementError as e:
+                return _error(422, "invalid_request", str(e))
             content_type = fields.get("content_type") or part_content_type
             computed_hash = "blake3:" + digest.hexdigest()
 
@@ -522,13 +592,13 @@ class Proxy:
             with open(tmp_path, "rb") as f:
                 data = f.read()
 
-            if self._is_model_path(file_path):
+            if is_model:
                 record, err = self._place_model_file(
-                    file_path, data, computed_hash, content_type, size, tags
+                    norm_path, data, computed_hash, content_type, size, tags
                 )
             else:
                 record, err = await self._upload_input(
-                    file_path, data, computed_hash, content_type, size, tags
+                    norm_path, file_path, data, computed_hash, content_type, size, tags
                 )
             if err is not None:
                 return err
@@ -539,14 +609,9 @@ class Proxy:
                 with contextlib.suppress(OSError):
                     os.unlink(tmp_path)
 
-    def _is_model_path(self, file_path: str) -> bool:
-        norm = file_path[len("models/") :] if file_path.startswith("models/") else file_path
-        parts = Path(norm).parts
-        return len(parts) >= 2 and parts[0] in MODEL_ROOTS
-
     def _place_model_file(
         self,
-        file_path: str,
+        norm: str,
         data: bytes,
         hash_: str,
         content_type: str,
@@ -566,17 +631,15 @@ class Proxy:
                 "invalid_request",
                 "Model uploads must be valid safetensors files (header check failed).",
             )
-        # security.resolve_placement_path() validates a category-relative
-        # path (e.g. "checkpoints/foo.safetensors") against a base_dir that
-        # IS the ComfyUI models/ directory (its MODEL_ROOTS keys are exactly
-        # folder_paths.py's folder_names_and_paths keys, which live directly
-        # under models/, not under the install root) — so strip an optional
-        # client-supplied "models/" prefix and resolve against
-        # `self.base_dir / "models"`, not `self.base_dir` itself. Passing the
-        # install root here (or leaving the "models/" prefix on) would make
-        # every model upload fail with "'models' is not an allowlisted
-        # placement root".
-        norm = file_path[len("models/") :] if file_path.startswith("models/") else file_path
+        # `norm` is already validated + "models/"-prefix-stripped by
+        # validate_upload_path (called once, before the model/input branch
+        # decision) — it is exactly the category-relative path (e.g.
+        # "checkpoints/foo.safetensors") resolve_placement_path() expects
+        # against a base_dir that IS the ComfyUI models/ directory (its
+        # MODEL_ROOTS keys are exactly folder_paths.py's
+        # folder_names_and_paths keys, which live directly under models/,
+        # not under the install root) — so resolve against
+        # `self.base_dir / "models"`, not `self.base_dir` itself.
         try:
             dest = resolve_placement_path(self.base_dir / "models", norm)
         except PlacementError as e:
@@ -585,11 +648,20 @@ class Proxy:
             atomic_no_clobber_write(dest, data)
         except PlacementError as e:
             return None, _error(409, "hash_mismatch", str(e))
+        # ComfyUI's combo widgets (and its model-loading nodes generally)
+        # reference a model by its path RELATIVE TO the model-root
+        # directory — folder_paths.get_filename_list()'s values never
+        # include the category segment itself. The value substituted for a
+        # core/ASSET reference to this file (see _resolve_asset_ref) must
+        # therefore be root-relative, not the category-qualified `norm`
+        # used for on-disk placement, or ComfyUI's combo validation rejects
+        # it as an unknown filename.
+        root_relative = posixpath.join(*Path(norm).parts[1:])
         record = self.assets.add(
             hash_=hash_,
             size_bytes=size,
             content_type=content_type,
-            file_path=file_path,
+            file_path=root_relative,
             disk_path=str(dest),
             tags=tags,
         )
@@ -597,20 +669,20 @@ class Proxy:
 
     async def _upload_input(
         self,
-        file_path: str,
+        norm: str,
+        orig_file_path: str,
         data: bytes,
         hash_: str,
         content_type: str,
         size: int,
         tags: list[str],
     ) -> tuple[AssetRecord | None, web.Response | None]:
-        # `input/` is the implicit namespace root for workflow inputs; a
-        # caller may name it explicitly (`input/photo.png`) or omit it
-        # (`photo.png`). Strip the redundant prefix so both land in the same
-        # place instead of a nested input/input/ subfolder.
-        normalized = file_path[len("input/") :] if file_path.startswith("input/") else file_path
-        subfolder = posixpath.dirname(normalized)
-        filename = posixpath.basename(normalized)
+        # `norm` is already validated + "input/"-prefix-stripped by
+        # validate_upload_path (called once, before the model/input branch
+        # decision) — derive subfolder/filename from it directly rather
+        # than re-parsing the raw client string here.
+        subfolder = posixpath.dirname(norm)
+        filename = posixpath.basename(norm)
         form = FormData()
         form.add_field("image", data, filename=filename, content_type=content_type)
         form.add_field("type", "input")
@@ -627,7 +699,7 @@ class Proxy:
             hash_=hash_,
             size_bytes=size,
             content_type=content_type,
-            file_path=file_path,
+            file_path=orig_file_path,
             comfy_ref={
                 "filename": resp.get("name", filename),
                 "subfolder": resp.get("subfolder", subfolder),
@@ -664,7 +736,7 @@ class Proxy:
         record = self.assets.get(asset_id)
         if record is not None:
             return web.json_response(self._asset_json(record, created_new=None))
-        decoded = _decode_asset_id(asset_id)
+        decoded = self._decode_asset_id(asset_id)
         if decoded is not None:
             now = _now()
             ctype = mimetypes.guess_type(decoded["f"])[0] or "application/octet-stream"
@@ -690,7 +762,7 @@ class Proxy:
             return web.FileResponse(record.disk_path)
         if record is not None and record.comfy_ref:
             return await self._stream_view(request, record.comfy_ref)
-        decoded = _decode_asset_id(asset_id)
+        decoded = self._decode_asset_id(asset_id)
         if decoded is not None:
             return await self._stream_view(
                 request,

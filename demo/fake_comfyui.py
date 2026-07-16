@@ -59,6 +59,13 @@ async def _auto_complete(prompt_id: str) -> None:
 async def prompt(request: web.Request) -> web.Response:
     body = await request.json()
     prompt_id = body["prompt_id"]
+    # Real ComfyUI records which client_id a prompt was submitted under and
+    # addresses that prompt's WS events (progress/preview/executing/
+    # execution_success/error/interrupted) at that client_id specifically —
+    # it never broadcasts to every open WS. Track it here too so `websocket`
+    # below can honor the same scoped-delivery contract instead of just
+    # blasting events at whichever job happens to be running.
+    client_id = body.get("client_id")
     graph = body.get("prompt", {})
     if not graph:
         return web.json_response(
@@ -71,7 +78,12 @@ async def prompt(request: web.Request) -> web.Response:
         and node["inputs"].get("hang") is True
         for node in graph.values()
     )
-    _jobs[prompt_id] = {"state": "running", "outputs": _default_outputs(), "hang": hang}
+    _jobs[prompt_id] = {
+        "state": "running",
+        "outputs": _default_outputs(),
+        "hang": hang,
+        "client_id": client_id,
+    }
     if not hang:
         asyncio.create_task(_auto_complete(prompt_id))
     return web.json_response({"prompt_id": prompt_id, "number": 1, "node_errors": {}})
@@ -143,6 +155,14 @@ async def cancel_job(request: web.Request) -> web.Response:
 async def websocket(request: web.Request) -> web.WebSocketResponse:
     ws = web.WebSocketResponse()
     await ws.prepare(request)
+    # The connecting client's clientId — real ComfyUI's /ws takes this as a
+    # query param and only ever delivers a given prompt's events to the
+    # connection whose clientId matches the one that prompt was submitted
+    # under (see `prompt()` above). Honoring that scoping here (instead of
+    # just picking "the" running job) is what makes this fake actually
+    # exercise per-client addressing rather than happening to work only
+    # because tests run one job at a time.
+    client_id = request.query.get("clientId")
     # feature_flags handshake: client sends first, server replies.
     async for msg in ws:
         if msg.type == WSMsgType.TEXT:
@@ -155,8 +175,16 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
         elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.ERROR):
             return ws
 
-    # Drive the most-recently-running job to a terminal WS signal.
-    pid = next((p for p, j in _jobs.items() if j["state"] == "running"), None)
+    # Drive only the running job that was submitted under THIS connection's
+    # client_id — never a job belonging to some other client.
+    pid = next(
+        (
+            p
+            for p, j in _jobs.items()
+            if j["state"] == "running" and j.get("client_id") == client_id
+        ),
+        None,
+    )
     if pid is not None:
         await ws.send_json(
             {"type": "progress", "data": {"value": 1, "max": 2, "node": "3", "prompt_id": pid}}

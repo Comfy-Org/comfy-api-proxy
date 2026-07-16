@@ -11,6 +11,7 @@ from comfy_api_proxy.security import (
     atomic_no_clobber_write,
     looks_like_safetensors,
     resolve_placement_path,
+    validate_upload_path,
 )
 
 
@@ -72,6 +73,56 @@ class TestResolvePlacementPath:
         existing.write_bytes(b"already here")
         with pytest.raises(PlacementError, match="overwrite"):
             resolve_placement_path(tmp_path, "input/photo.png")
+
+
+class TestValidateUploadPath:
+    """Regression coverage for the shared pre-classification path
+    validator (see app.py's ``upload_asset``): a file_path like
+    ``input/../checkpoints/evil.safetensors`` used to be classified as a
+    plain input upload (its first path segment is "input"), which skipped
+    the model-placement guard entirely and let the ".." ride along into an
+    unvalidated posixpath.dirname/basename split. validate_upload_path is
+    the single choke point that now runs before that classification."""
+
+    def test_rejects_dotdot_disguised_as_input_path(self):
+        with pytest.raises(PlacementError, match=r"\.\."):
+            validate_upload_path("input/../checkpoints/evil.safetensors")
+
+    def test_rejects_dotdot_climbing_multiple_levels(self):
+        with pytest.raises(PlacementError, match=r"\.\."):
+            validate_upload_path("input/../../etc/cron.d/pwn")
+
+    def test_rejects_dotdot_via_models_prefix(self):
+        with pytest.raises(PlacementError, match=r"\.\."):
+            validate_upload_path("models/../../etc/passwd")
+
+    def test_rejects_absolute_path(self):
+        with pytest.raises(PlacementError, match="relative"):
+            validate_upload_path("/etc/passwd")
+
+    def test_accepts_normal_input_path(self):
+        is_model, norm = validate_upload_path("input/foo.png")
+        assert is_model is False
+        assert norm == "foo.png"
+
+    def test_accepts_bare_filename_as_implicit_input(self):
+        is_model, norm = validate_upload_path("foo.png")
+        assert is_model is False
+        assert norm == "foo.png"
+
+    def test_accepts_normal_model_path(self):
+        is_model, norm = validate_upload_path("checkpoints/foo.safetensors")
+        assert is_model is True
+        assert norm == "checkpoints/foo.safetensors"
+
+    def test_accepts_model_path_with_models_prefix(self):
+        is_model, norm = validate_upload_path("models/checkpoints/foo.safetensors")
+        assert is_model is True
+        assert norm == "checkpoints/foo.safetensors"
+
+    def test_rejects_unlisted_root(self):
+        with pytest.raises(PlacementError, match="not an allowlisted"):
+            validate_upload_path("custom_nodes/evil.py")
 
 
 class TestAtomicNoClobberWrite:

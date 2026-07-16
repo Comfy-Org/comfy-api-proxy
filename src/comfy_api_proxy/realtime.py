@@ -31,7 +31,6 @@ import asyncio
 import json
 import struct
 import time
-import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
@@ -72,11 +71,18 @@ class JobEventBridge:
         comfyui_url: str,
         prompt_id: str,
         *,
+        client_id: str,
         snapshot: StatusSnapshotFn,
         session: aiohttp.ClientSession,
     ) -> None:
         self._comfyui = comfyui_url.rstrip("/")
         self._prompt_id = prompt_id
+        # Must match the client_id the prompt was SUBMITTED under — ComfyUI
+        # addresses progress/preview/executing/executed/execution_success/
+        # error/interrupted WS events at that specific client_id, never
+        # broadcasting them. A bridge connecting under a different (e.g.
+        # freshly-random) client_id would never see this job's events.
+        self._client_id = client_id
         self._snapshot = snapshot
         self._session = session
         self._last_progress_emit = 0.0
@@ -101,9 +107,8 @@ class JobEventBridge:
         if snap.get("progress"):
             yield sse_frame("progress", snap["progress"])
 
-        client_id = uuid.uuid4().hex
         try:
-            async for frame in self._pump_ws(client_id):
+            async for frame in self._pump_ws(self._client_id):
                 yield frame
         except (aiohttp.ClientError, asyncio.TimeoutError):
             # WS unreachable/broke: fall back to poll-driven terminal detection

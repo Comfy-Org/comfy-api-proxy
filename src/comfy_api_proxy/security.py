@@ -17,6 +17,7 @@ Two distinct trust boundaries meet in this module:
 from __future__ import annotations
 
 import os
+import posixpath
 import struct
 from pathlib import Path
 
@@ -64,6 +65,76 @@ _MODEL_EXTENSIONS = {".safetensors"}
 
 class PlacementError(ValueError):
     """A requested file_path is not an acceptable placement target."""
+
+
+def validate_upload_path(file_path: str) -> tuple[bool, str]:
+    """Validate and classify a caller-supplied upload ``file_path`` as the
+    very first thing that happens to it — BEFORE the caller decides
+    whether this is a model-directory placement or a plain input upload.
+
+    This closes a misclassification bypass: a path like
+    ``input/../checkpoints/evil.safetensors`` has ``Path(...).parts[0] ==
+    "input"``, so a classifier that only looks at the first segment (as
+    the model-vs-input branch used to) waves it through as "just an input
+    upload" and hands it to a code path that never applies the
+    model-placement guards at all — letting the ``..`` ride along into
+    whatever the input-upload path does with the string. Checking for
+    ``..``/absolute *before* classification, on the whole path, means
+    there is no way to smuggle a traversal segment past this by picking a
+    first segment that classifies as harmless.
+
+    Returns ``(is_model, norm)``:
+
+      * ``is_model`` — ``True`` if this is a model-directory placement
+        (the first segment, after stripping an optional leading
+        ``"models/"`` convention prefix, names a ``MODEL_ROOTS``
+        category), ``False`` for an input upload.
+      * ``norm`` — the validated remainder a caller should use from here
+        on, *instead of re-parsing the raw client string*:
+          - for a model path: the ``"models/"``-prefix-stripped,
+            category-qualified path (e.g. ``"checkpoints/x.safetensors"``),
+            i.e. exactly what ``resolve_placement_path`` expects.
+          - for an input path: the ``"input/"``-prefix-stripped remainder
+            (e.g. ``"x.png"``), or the original string unchanged if it
+            was a bare filename with no root segment at all (the
+            long-standing implicit-input convention).
+
+    Raises ``PlacementError`` if ``file_path`` is empty, absolute, contains
+    a ``..`` segment anywhere, or names an unrecognized root when a root
+    segment is present.
+    """
+    if not file_path or file_path.startswith(("/", "\\")):
+        raise PlacementError(f"file_path must be relative: {file_path!r}")
+
+    # An optional "models/" prefix is a convention for model uploads
+    # (mirrors the "input/" convention below) — normalize it away before
+    # splitting, so classification and the "-.." check both see the same
+    # shape regardless of whether the caller included it.
+    stripped = file_path[len("models/") :] if file_path.startswith("models/") else file_path
+
+    parts = Path(stripped).parts
+    if not parts:
+        raise PlacementError(f"file_path must include a filename: {file_path!r}")
+    if any(p in ("..", "") for p in parts):
+        raise PlacementError(f"file_path must not contain '..': {file_path!r}")
+
+    if len(parts) < 2:
+        # A single bare segment (e.g. "photo.png"): the long-standing
+        # implicit-input convention. No root name to validate.
+        return False, stripped
+
+    root = parts[0]
+    if root not in MODEL_ROOTS and root not in INPUT_ROOTS:
+        raise PlacementError(
+            f"'{root}' is not an allowlisted placement root "
+            f"(allowed: {sorted(INPUT_ROOTS | MODEL_ROOTS)})"
+        )
+    if root in MODEL_ROOTS:
+        return True, stripped
+    # root in INPUT_ROOTS ("input"): strip the redundant root segment so a
+    # caller lands in the same place whether or not they named it
+    # explicitly, matching the pre-existing convention.
+    return False, posixpath.join(*parts[1:])
 
 
 def resolve_placement_path(base_dir: Path, file_path: str) -> Path:
