@@ -25,10 +25,16 @@ from .middleware import origin_only_middleware
 
 
 def _is_loopback_host(host: str) -> bool:
+    # NB: an empty host is NOT loopback — asyncio/socket treat "" (like None)
+    # as "bind all interfaces" (0.0.0.0/::), so `--host ""` would otherwise
+    # sail past the "require a token for any non-loopback bind" check below and
+    # expose the API unauthenticated on every interface.
+    if not host:
+        return False
     try:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
-        return host in ("localhost", "")
+        return host == "localhost"
 
 
 def main(argv: list[str] | None = None) -> int:

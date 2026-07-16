@@ -50,8 +50,8 @@ def _default_outputs() -> dict:
     return {"9": {"images": [{"filename": "out.png", "subfolder": "", "type": "output"}]}}
 
 
-async def _auto_complete(prompt_id: str) -> None:
-    await asyncio.sleep(_COMPLETE_DELAY)
+async def _auto_complete(prompt_id: str, delay: float = _COMPLETE_DELAY) -> None:
+    await asyncio.sleep(delay)
     job = _jobs.get(prompt_id)
     if job and job["state"] == "running" and not job["hang"]:
         job["state"] = "success"
@@ -92,6 +92,15 @@ async def prompt(request: web.Request) -> web.Response:
         and node["inputs"].get("hang") is True
         for node in graph.values()
     )
+    # A workflow may set `complete_after_seconds` on any node to control how
+    # long the fake stays running — lets a test connect its SSE stream before
+    # the job completes without racing the default 0.2s timer.
+    complete_after = _COMPLETE_DELAY
+    for node in graph.values():
+        if isinstance(node, dict) and isinstance(node.get("inputs"), dict):
+            v = node["inputs"].get("complete_after_seconds")
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                complete_after = float(v)
     _jobs[prompt_id] = {
         "state": "running",
         "outputs": _default_outputs(),
@@ -99,7 +108,7 @@ async def prompt(request: web.Request) -> web.Response:
         "client_id": client_id,
     }
     if not hang:
-        asyncio.create_task(_auto_complete(prompt_id))
+        asyncio.create_task(_auto_complete(prompt_id, complete_after))
     return web.json_response({"prompt_id": prompt_id, "number": 1, "node_errors": {}})
 
 

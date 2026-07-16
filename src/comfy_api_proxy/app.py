@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any
 
 import blake3
-from aiohttp import BodyPartReader, ClientSession, ClientTimeout, FormData, web
+from aiohttp import BodyPartReader, ClientError, ClientSession, ClientTimeout, FormData, web
 
 from .assets import AssetRecord, AssetStore
 from .realtime import JobEventBridge
@@ -118,6 +118,26 @@ def _is_asset_ref(value: Any) -> bool:
     return isinstance(value, dict) and value.get("__type") == "core/ASSET"
 
 
+class UpstreamUnreachable(Exception):
+    """Raised when ComfyUI can't be reached at all (down, restarting, ...), so
+    callers can map it to a proper `upstream_unreachable` error envelope
+    instead of letting the raw transport error surface as a bare 500."""
+
+
+def _valid_job_id(job_id: str) -> bool:
+    """Job ids are minted server-side as uuid4 strings (see Proxy.submit). A
+    non-UUID id is never legitimate and — worse — would be spliced verbatim
+    into the upstream ComfyUI request path (see _get_json / cancel_job): a
+    dot-segment gets normalized by the HTTP client into an arbitrary ComfyUI
+    path, and a literal '?' injects a query string. Reject before any upstream
+    call is made rather than trying to sanitize."""
+    try:
+        uuid.UUID(job_id)
+        return True
+    except ValueError:
+        return False
+
+
 class Proxy:
     def __init__(
         self,
@@ -158,12 +178,19 @@ class Proxy:
         return self._session
 
     # -- stateless output asset ids -------------------------------------------
-    def _asset_id(self, filename: str, subfolder: str, type_: str) -> str:
+    def _asset_id(self, job_id: str, filename: str, subfolder: str, type_: str) -> str:
         """Encode a ComfyUI file reference into a stateless, deterministic,
         HMAC-signed asset id, so a job's outputs get stable ids across
         polls without a durable store. Uploaded assets use random UUIDs
         (see assets.new_asset_id); the two are told apart at read time by
         whether this decodes.
+
+        The job id is part of the signed payload so two DIFFERENT jobs that
+        happen to produce the same filename/subfolder/type (ComfyUI reuses
+        output filenames whenever a workflow uses a fixed prefix, or after a
+        restart resets its counter) get DISTINCT asset ids — otherwise a
+        client that cached job A's output URL could later be served job B's
+        bytes under the same "stable" id.
 
         The payload is signed with a per-process secret (see
         ``self._asset_secret``) so a client cannot forge an id naming an
@@ -173,7 +200,7 @@ class Proxy:
         attacker-chosen path into a submitted workflow via
         ``_resolve_asset_ref``.
         """
-        raw = json.dumps({"f": filename, "s": subfolder, "t": type_}).encode()
+        raw = json.dumps({"j": job_id, "f": filename, "s": subfolder, "t": type_}).encode()
         payload_b64 = base64.urlsafe_b64encode(raw).decode().rstrip("=")
         tag = hmac.new(self._asset_secret, payload_b64.encode(), hashlib.sha256).digest()
         tag_b64 = base64.urlsafe_b64encode(tag).decode().rstrip("=")
@@ -205,14 +232,20 @@ class Proxy:
         except Exception:
             return None
         if isinstance(ref, dict) and {"f", "s", "t"} <= ref.keys():
+            # "j" (job id) is present on ids minted after the per-job-scoping
+            # change; only f/s/t are read downstream (content fetch / asset-ref
+            # resolution), so its presence or absence is harmless here.
             return ref
         return None
 
     # -- upstream helpers ----------------------------------------------------
     async def _get_json(self, path: str) -> tuple[int, Any]:
-        async with self.session.get(self.comfyui + path) as r:
-            body = await r.json() if r.content_type == "application/json" else await r.text()
-            return r.status, body
+        try:
+            async with self.session.get(self.comfyui + path) as r:
+                body = await r.json() if r.content_type == "application/json" else await r.text()
+                return r.status, body
+        except (ClientError, asyncio.TimeoutError) as e:
+            raise UpstreamUnreachable(str(e)) from e
 
     # -- job status mapping --------------------------------------------------
     async def _status_of(self, job_id: str, base: str) -> dict[str, Any]:
@@ -227,12 +260,12 @@ class Proxy:
                 ev == "execution_interrupted" for ev, _ in messages if isinstance(ev, str)
             )
             if interrupted:
-                return {"status": "canceled", "outputs": self._outputs(entry, base)}
+                return {"status": "canceled", "outputs": self._outputs(job_id, entry, base)}
             if status_str == "success":
-                return {"status": "succeeded", "outputs": self._outputs(entry, base)}
+                return {"status": "succeeded", "outputs": self._outputs(job_id, entry, base)}
             return {
                 "status": "failed",
-                "outputs": self._outputs(entry, base),
+                "outputs": self._outputs(job_id, entry, base),
                 "error": self._error_from(entry),
             }
         # 2) Not terminal: is it running or still queued?
@@ -260,7 +293,7 @@ class Proxy:
         # schema-valid running snapshot. The SSE stream carries the live one.
         return {"value": 0.0, "nodes_done": 0, "nodes_total": 0}
 
-    def _outputs(self, entry: dict[str, Any], base: str) -> list[dict[str, Any]]:
+    def _outputs(self, job_id: str, entry: dict[str, Any], base: str) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         for node_id, node_out in (entry.get("outputs") or {}).items():
             for key, items in node_out.items():
@@ -271,7 +304,7 @@ class Proxy:
                     if not isinstance(it, dict) or "filename" not in it:
                         continue
                     aid = self._asset_id(
-                        it["filename"], it.get("subfolder", ""), it.get("type", "output")
+                        job_id, it["filename"], it.get("subfolder", ""), it.get("type", "output")
                     )
                     ctype = mimetypes.guess_type(it["filename"])[0] or "application/octet-stream"
                     now = _now()
@@ -435,12 +468,15 @@ class Proxy:
             "prompt_id": job_id,
             "client_id": job_id,
         }
-        async with self.session.post(self.comfyui + "/prompt", json=payload) as r:
-            data = await r.json() if r.content_type == "application/json" else {}
-            if r.status != 200:
-                node_errors = data.get("node_errors") or {}
-                msg = (data.get("error") or {}).get("message", "Workflow rejected.")
-                return _error(422, "invalid_workflow", msg, node_errors=node_errors)
+        try:
+            async with self.session.post(self.comfyui + "/prompt", json=payload) as r:
+                data = await r.json() if r.content_type == "application/json" else {}
+                if r.status != 200:
+                    node_errors = data.get("node_errors") or {}
+                    msg = (data.get("error") or {}).get("message", "Workflow rejected.")
+                    return _error(422, "invalid_workflow", msg, node_errors=node_errors)
+        except (ClientError, asyncio.TimeoutError):
+            return _error(503, "upstream_unreachable", "Could not reach ComfyUI to submit the job.")
         self._jobs[job_id] = {"workflow": workflow, "created_at": _now(), "client_id": job_id}
         base = _external_base(request)
         return web.json_response(
@@ -449,19 +485,29 @@ class Proxy:
 
     async def get_job(self, request: web.Request) -> web.Response:
         job_id = request.match_info["id"]
+        if not _valid_job_id(job_id):
+            return _error(404, "not_found", f"No job {job_id}.")
         base = _external_base(request)
-        state = await self._status_of(job_id, base)
+        try:
+            state = await self._status_of(job_id, base)
+        except UpstreamUnreachable:
+            return _error(503, "upstream_unreachable", "Could not reach ComfyUI.")
         if state["status"] == "unknown" and job_id not in self._jobs:
             return _error(404, "not_found", f"No job {job_id}.")
         return web.json_response(self._job(job_id, state, base))
 
     async def cancel_job(self, request: web.Request) -> web.Response:
         job_id = request.match_info["id"]
+        if not _valid_job_id(job_id):
+            return _error(404, "not_found", f"No job {job_id}.")
         base = _external_base(request)
         if job_id not in self._jobs:
             # Allow cancel of an id ComfyUI still knows even if the proxy
             # restarted; a wholly unknown id is a 404.
-            state = await self._status_of(job_id, base)
+            try:
+                state = await self._status_of(job_id, base)
+            except UpstreamUnreachable:
+                return _error(503, "upstream_unreachable", "Could not reach ComfyUI.")
             if state["status"] == "unknown":
                 return _error(404, "not_found", f"No job {job_id}.")
         # ComfyUI's atomic per-id cancel (interrupt-if-running or dequeue).
@@ -469,8 +515,11 @@ class Proxy:
             async with self.session.post(self.comfyui + f"/api/jobs/{job_id}/cancel") as r:
                 await r.read()
         except Exception:
-            return _error(500, "upstream_error", "Failed to reach ComfyUI to cancel.")
-        state = await self._status_of(job_id, base)
+            return _error(503, "upstream_unreachable", "Could not reach ComfyUI to cancel.")
+        try:
+            state = await self._status_of(job_id, base)
+        except UpstreamUnreachable:
+            return _error(503, "upstream_unreachable", "Could not reach ComfyUI.")
         # A cancel of a still-running job reports `canceling` until the
         # interrupt lands at the next node boundary.
         if state["status"] == "running":
@@ -479,8 +528,13 @@ class Proxy:
 
     async def job_events(self, request: web.Request) -> web.StreamResponse:
         job_id = request.match_info["id"]
+        if not _valid_job_id(job_id):
+            return _error(404, "not_found", f"No job {job_id}.")
         base = _external_base(request)
-        state = await self._status_of(job_id, base)
+        try:
+            state = await self._status_of(job_id, base)
+        except UpstreamUnreachable:
+            return _error(503, "upstream_unreachable", "Could not reach ComfyUI.")
         if state["status"] == "unknown" and job_id not in self._jobs:
             return _error(404, "not_found", f"No job {job_id}.")
         if self._open_streams >= _MAX_CONCURRENT_STREAMS:
@@ -526,7 +580,11 @@ class Proxy:
         try:
             async for frame in bridge.stream():
                 await response.write(frame)
-        except (ConnectionResetError, asyncio.CancelledError):
+        except (ConnectionResetError, asyncio.CancelledError, UpstreamUnreachable):
+            # Headers were already sent (response.prepare above), so a
+            # mid-stream ComfyUI outage can't change the status code — end the
+            # stream cleanly and let the client fall back to polling (which now
+            # returns a proper upstream_unreachable envelope).
             pass
         finally:
             self._open_streams -= 1

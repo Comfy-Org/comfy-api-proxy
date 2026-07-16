@@ -17,6 +17,8 @@ import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from comfy_api_proxy.app import _MAX_CONCURRENT_STREAMS
 
 # A 1x1 PNG, same bytes the fake serves — content the proxy hashes for dedup.
@@ -258,7 +260,12 @@ def test_sse_stream_delivers_output_event_and_no_log(stack):
     # `execution_success`, so the stream surfaces a live `output` event — exactly
     # once (deduped against the terminal reconcile). And it emits no `log` event,
     # matching the Comfy Cloud surface (feature parity).
-    workflow = {"9": {"class_type": "SaveImage", "inputs": {}}}
+    #
+    # `complete_after_seconds` gives the SSE stream a generous, test-controlled
+    # window to connect and take its initial snapshot BEFORE the job goes
+    # terminal, so this deterministically exercises the live executed→output
+    # path rather than racing the fake's default 0.2s auto-complete.
+    workflow = {"9": {"class_type": "SaveImage", "inputs": {"complete_after_seconds": 2.0}}}
     _, job, _ = stack.request("POST", "/api/v2/jobs", {"workflow": workflow})
 
     events = stack.read_sse(job["urls"]["events"], timeout=20.0)
@@ -306,6 +313,112 @@ def test_on_text_drops_log_on_execution_error():
         )
     )
     assert frames == [], f"execution_error must not emit a `log` frame: {frames}"
+
+
+def test_get_job_rejects_non_uuid_id_before_any_upstream_call(stack):
+    # A dot-segment id would otherwise be spliced into the upstream ComfyUI
+    # path and normalized into an arbitrary endpoint. Reject with 404 first.
+    status, body, _ = stack.request("GET", "/api/v2/jobs/..%2F..%2Ffree")
+    assert status == 404, body
+    assert body["error"]["code"] == "not_found"
+
+
+def test_cancel_job_rejects_path_traversal_id(stack):
+    status, body, _ = stack.request("POST", "/api/v2/jobs/..%2F..%2Ffree/cancel")
+    assert status == 404, body
+    assert body["error"]["code"] == "not_found"
+
+
+def test_job_events_rejects_non_uuid_id(stack):
+    status, body, _ = stack.request("GET", "/api/v2/jobs/not-a-uuid/events")
+    assert status == 404, body
+    assert body["error"]["code"] == "not_found"
+
+
+def test_output_asset_ids_are_scoped_per_job(stack):
+    # The fake ComfyUI names every output "out.png" (demo/fake_comfyui.py), so
+    # any two jobs collide on filename today — their asset ids must NOT collide,
+    # or a cached URL from job A could later serve job B's bytes.
+    wf = {"9": {"class_type": "SaveImage", "inputs": {}}}
+    _, job1, _ = stack.request("POST", "/api/v2/jobs", {"workflow": wf})
+    _, job2, _ = stack.request("POST", "/api/v2/jobs", {"workflow": wf})
+    job1 = _poll_until_terminal(stack, job1)
+    job2 = _poll_until_terminal(stack, job2)
+    out1, out2 = job1["outputs"][0], job2["outputs"][0]
+    assert out1["name"] == out2["name"] == "out.png"
+    assert out1["id"] != out2["id"], "output asset ids must be job-scoped"
+    assert out1["url"] != out2["url"]
+
+
+def test_realtime_parsers_ignore_non_dict_json_frames():
+    # A valid-JSON but non-object WS frame (plausibly from a buggy/malicious
+    # custom node) must not crash the stream with an AttributeError.
+    from comfy_api_proxy.realtime import JobEventBridge
+
+    bridge = JobEventBridge(
+        "http://comfy.invalid",
+        "11111111-1111-1111-1111-111111111111",
+        client_id="c",
+        snapshot=None,  # type: ignore[arg-type]
+        session=None,  # type: ignore[arg-type]
+    )
+    for frame in ("[1,2,3]", "42", "null", '"a string"'):
+        assert bridge._on_text(frame) == []
+        assert bridge._is_terminal_text(frame) is False
+        assert bridge._is_executed_text(frame) is False
+
+
+async def test_reconcile_outputs_is_throttled():
+    # Two executed-driven reconciles within the throttle window must trigger
+    # only ONE re-snapshot (the /history re-fetch), not one per executed frame.
+    from comfy_api_proxy.realtime import JobEventBridge
+
+    calls: list[int] = []
+
+    async def fake_snapshot() -> dict:
+        calls.append(1)
+        return {"status": "running", "outputs": []}
+
+    bridge = JobEventBridge(
+        "http://comfy.invalid",
+        "11111111-1111-1111-1111-111111111111",
+        client_id="c",
+        snapshot=fake_snapshot,
+        session=None,  # type: ignore[arg-type]
+    )
+    seen: set[str] = set()
+    await bridge._reconcile_outputs(seen)
+    await bridge._reconcile_outputs(seen)
+    assert len(calls) == 1, "back-to-back executed reconciles must coalesce into one snapshot"
+
+
+async def test_status_of_raises_upstream_unreachable_when_comfyui_down():
+    from comfy_api_proxy.app import Proxy, UpstreamUnreachable
+
+    proxy = Proxy("http://127.0.0.1:1")  # port 1 → connection refused
+    await proxy.on_startup(None)
+    try:
+        with pytest.raises(UpstreamUnreachable):
+            await proxy._status_of("11111111-1111-1111-1111-111111111111", "http://x")
+    finally:
+        await proxy.on_cleanup(None)
+
+
+async def test_get_job_maps_upstream_unreachable_to_503_envelope():
+    from aiohttp.test_utils import make_mocked_request
+
+    from comfy_api_proxy.app import Proxy
+
+    proxy = Proxy("http://127.0.0.1:1")
+    await proxy.on_startup(None)
+    try:
+        jid = "11111111-1111-1111-1111-111111111111"
+        req = make_mocked_request("GET", f"/api/v2/jobs/{jid}", match_info={"id": jid})
+        resp = await proxy.get_job(req)
+        assert resp.status == 503
+        assert json.loads(resp.body)["error"]["code"] == "upstream_unreachable"
+    finally:
+        await proxy.on_cleanup(None)
 
 
 def test_content_range_request(stack):

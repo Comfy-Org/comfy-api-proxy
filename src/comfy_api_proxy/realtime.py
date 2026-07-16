@@ -87,6 +87,7 @@ class JobEventBridge:
         self._session = session
         self._last_progress_emit = 0.0
         self._last_preview_emit = 0.0
+        self._last_output_emit = 0.0
         self._terminal = {"succeeded", "failed", "canceled", "expired"}
 
     def _ws_url(self, client_id: str) -> str:
@@ -103,6 +104,12 @@ class JobEventBridge:
         snap = await self._snapshot()
         yield sse_frame("status", self._status_event(snap))
         if snap.get("status") in self._terminal:
+            # Already terminal on connect (late/reconnecting client): still
+            # deliver the job's outputs, matching every other terminal path in
+            # this file. Without this, a client connecting after completion got
+            # only `status` and had to fall back to GET /jobs/{id} for outputs.
+            for frame in self._final_outputs(snap, set()):
+                yield frame
             return
         if snap.get("progress"):
             yield sse_frame("progress", snap["progress"])
@@ -155,10 +162,12 @@ class JobEventBridge:
                     # snapshot yet, it is simply picked up on a later `executed`
                     # or the terminal reconcile below. The snapshot stays
                     # authoritative and seen_outputs guarantees no output is
-                    # ever emitted twice.
+                    # ever emitted twice. Coalesced to ~2/s so a workflow with
+                    # many output nodes can't fire one /history re-fetch per
+                    # node (a skipped fetch loses nothing — the next allowed
+                    # `executed` or the terminal reconcile still delivers them).
                     if self._is_executed_text(msg.data):
-                        snap = await self._snapshot()
-                        for frame in self._final_outputs(snap, seen_outputs):
+                        for frame in await self._reconcile_outputs(seen_outputs):
                             yield frame
                     # A terminal text event ends the stream after reconciling.
                     if self._is_terminal_text(msg.data):
@@ -191,6 +200,8 @@ class JobEventBridge:
             msg = json.loads(raw)
         except json.JSONDecodeError:
             return []
+        if not isinstance(msg, dict):
+            return []
         mtype = msg.get("type")
         data = msg.get("data") or {}
         # ComfyUI targets prompt-scoped messages with a prompt_id; ignore
@@ -216,6 +227,8 @@ class JobEventBridge:
             msg = json.loads(raw)
         except json.JSONDecodeError:
             return False
+        if not isinstance(msg, dict):
+            return False
         data = msg.get("data") or {}
         pid = data.get("prompt_id")
         if pid is not None and pid != self._prompt_id:
@@ -235,6 +248,8 @@ class JobEventBridge:
         try:
             msg = json.loads(raw)
         except json.JSONDecodeError:
+            return False
+        if not isinstance(msg, dict):
             return False
         data = msg.get("data") or {}
         pid = data.get("prompt_id")
@@ -306,6 +321,19 @@ class JobEventBridge:
                 "data_base64": base64.b64encode(image_bytes).decode("ascii"),
             },
         )
+
+    async def _reconcile_outputs(self, seen: set[str]) -> list[bytes]:
+        """Re-snapshot and return SSE frames for any newly-committed outputs
+        (deduped via ``seen``), throttled to ~2/s so a burst of ``executed``
+        frames can't fan out into a burst of /history re-fetches. A skipped
+        window loses nothing — the next allowed ``executed`` or the terminal
+        reconcile still delivers those outputs."""
+        now = time.monotonic()
+        if now - self._last_output_emit < _THROTTLE_SECONDS:
+            return []
+        self._last_output_emit = now
+        snap = await self._snapshot()
+        return self._final_outputs(snap, seen)
 
     def _final_outputs(self, snap: dict[str, Any], seen: set[str]) -> list[bytes]:
         frames = []
