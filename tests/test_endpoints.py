@@ -252,6 +252,62 @@ def test_sse_stream_delivers_progress_preview_and_terminal(stack):
     assert preview["data_base64"]
 
 
+def test_sse_stream_delivers_output_event_and_no_log(stack):
+    # A normally-completing job: the bridge connects while it is running, then
+    # the fake fires `executed` (a node's outputs committed) before the terminal
+    # `execution_success`, so the stream surfaces a live `output` event — exactly
+    # once (deduped against the terminal reconcile). And it emits no `log` event,
+    # matching the Comfy Cloud surface (feature parity).
+    workflow = {"9": {"class_type": "SaveImage", "inputs": {}}}
+    _, job, _ = stack.request("POST", "/api/v2/jobs", {"workflow": workflow})
+
+    events = stack.read_sse(job["urls"]["events"], timeout=20.0)
+    kinds = [name for name, _ in events]
+
+    outputs = [d for n, d in events if n == "output"]
+    assert len(outputs) == 1, f"expected exactly one live output event, got kinds={kinds}"
+    out = outputs[0]
+    assert out.get("id"), out
+    assert out.get("url"), out
+    assert out.get("node_id") == "9", out
+
+    assert "log" not in kinds, f"`log` must not be emitted (parity with public-api): {kinds}"
+
+    # The `output` event arrives before the terminal status (it's a live,
+    # ahead-of-terminal delivery, not a terminal batch).
+    assert "output" in kinds and "status" in kinds
+    assert kinds.index("output") < len(kinds) - 1, kinds
+    terminal = [d for n, d in events if n == "status" and d.get("status") in _TERMINAL]
+    assert terminal, f"no terminal status: {kinds}"
+
+
+def test_on_text_drops_log_on_execution_error():
+    # Unit-level parity check: `execution_error` yields NO `log` frame (it is
+    # handled purely as a terminal transition elsewhere). _on_text needs neither
+    # the snapshot fn nor the session for this path, so both are left unset.
+    from comfy_api_proxy.realtime import JobEventBridge
+
+    bridge = JobEventBridge(
+        "http://comfy.invalid",
+        "11111111-1111-1111-1111-111111111111",
+        client_id="c",
+        snapshot=None,  # type: ignore[arg-type]
+        session=None,  # type: ignore[arg-type]
+    )
+    frames = bridge._on_text(
+        json.dumps(
+            {
+                "type": "execution_error",
+                "data": {
+                    "prompt_id": "11111111-1111-1111-1111-111111111111",
+                    "exception_message": "boom",
+                },
+            }
+        )
+    )
+    assert frames == [], f"execution_error must not emit a `log` frame: {frames}"
+
+
 def test_content_range_request(stack):
     _, asset, _ = stack.upload("cat.png", _PNG, "image/png")
     status, _, content = stack.request("GET", asset["url"], headers={"Range": "bytes=0-3"})

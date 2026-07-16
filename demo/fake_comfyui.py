@@ -210,6 +210,20 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
         for _ in range(200):
             state = _jobs.get(pid, {}).get("state")
             if state == "success":
+                # Real ComfyUI fires `executed` (a node's committed outputs)
+                # before the terminal `execution_success`; by now /history
+                # already carries this job's outputs, so the proxy can surface
+                # them as a live `output` event ahead of the terminal status.
+                await ws.send_json(
+                    {
+                        "type": "executed",
+                        "data": {
+                            "node": "9",
+                            "output": _default_outputs()["9"],
+                            "prompt_id": pid,
+                        },
+                    }
+                )
                 await ws.send_json({"type": "execution_success", "data": {"prompt_id": pid}})
                 break
             if state == "interrupted":

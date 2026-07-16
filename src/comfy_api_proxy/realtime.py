@@ -148,6 +148,18 @@ class JobEventBridge:
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     for frame in self._on_text(msg.data):
                         yield frame
+                    # An `executed` frame means a node's outputs have just been
+                    # committed — surface them live (deduped via seen_outputs)
+                    # rather than only at the terminal transition. Best-effort:
+                    # if an output's durable asset isn't resolvable in the
+                    # snapshot yet, it is simply picked up on a later `executed`
+                    # or the terminal reconcile below. The snapshot stays
+                    # authoritative and seen_outputs guarantees no output is
+                    # ever emitted twice.
+                    if self._is_executed_text(msg.data):
+                        snap = await self._snapshot()
+                        for frame in self._final_outputs(snap, seen_outputs):
+                            yield frame
                     # A terminal text event ends the stream after reconciling.
                     if self._is_terminal_text(msg.data):
                         snap = await self._snapshot()
@@ -193,13 +205,10 @@ class JobEventBridge:
                 return []
             self._last_progress_emit = now
             return [sse_frame("progress", self._translate_progress(mtype, data))]
-        if mtype == "execution_error":
-            return [
-                sse_frame(
-                    "log",
-                    {"level": "error", "message": str(data.get("exception_message", "error"))},
-                )
-            ]
+        # `execution_error` is surfaced purely as a terminal transition — the
+        # final `status` event carries the failure. No separate `log` event is
+        # emitted: the v2 contract reserves `log` as not-yet-emitted, matching
+        # the Comfy Cloud surface, so the two stay at feature parity.
         return []
 
     def _is_terminal_text(self, raw: str) -> bool:
@@ -218,6 +227,20 @@ class JobEventBridge:
             "execution_error",
             "execution_interrupted",
         )
+
+    def _is_executed_text(self, raw: str) -> bool:
+        """True for an ``executed`` frame addressed to this prompt — the signal
+        that a node's outputs have just been committed, so they can be surfaced
+        as a live ``output`` event instead of only at the terminal transition."""
+        try:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            return False
+        data = msg.get("data") or {}
+        pid = data.get("prompt_id")
+        if pid is not None and pid != self._prompt_id:
+            return False
+        return msg.get("type") == "executed"
 
     def _translate_progress(self, mtype: str, data: dict[str, Any]) -> dict[str, Any]:
         if mtype == "progress":
