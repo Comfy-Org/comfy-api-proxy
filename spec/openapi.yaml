@@ -18,14 +18,13 @@ info:
   version: 2.0.0
   description: "The official, versioned HTTP API for running ComfyUI workflows from\nexternal\
     \ applications: upload inputs, submit a workflow, observe\nexecution, retrieve results.\n\
-    \nDesign principles (see the Comfy SDK TDD for the full rationale):\n- **Poll-first.**\
-    \ Every capability is reachable via plain GET polling;\n  the SSE stream is a live enhancement,\
-    \ never the source of truth.\n- **Everything is resumable.** Submission is idempotent;\
-    \ job state and\n  outputs are retrievable by ID until `expires_at`.\n- **UUID identity,\
-    \ content-addressed dedup.** Assets are UUID-identified\n  records over blobs keyed by\
-    \ a server-computed blake3 hash. The hash is\n  nullable and may be computed lazily.\n\
-    - **Follow links, don't build URLs.** Responses embed follow-up URLs.\n\nAdditive changes\
-    \ only within v2; breaking changes require v3.\n"
+    \nDesign principles:\n- **Poll-first.** Every capability is reachable via plain GET polling;\n\
+    \  the SSE stream is a live enhancement, never the source of truth.\n- **Everything is\
+    \ resumable.** Submission is idempotent; job state and\n  outputs are retrievable by ID\
+    \ until `expires_at`.\n- **UUID identity, content-addressed dedup.** Assets are UUID-identified\n\
+    \  records over blobs keyed by a server-computed blake3 hash. The hash is\n  nullable\
+    \ and may be computed lazily.\n- **Follow links, don't build URLs.** Responses embed follow-up\
+    \ URLs.\n\nAdditive changes only within v2; breaking changes require v3.\n"
 servers:
 - url: http://127.0.0.1:8189
   description: Self-hosted (comfy-api-proxy)
@@ -71,7 +70,7 @@ paths:
 
         ~100 MB single-request expectation for v1; chunked/resumable large
 
-        uploads are a deliberate open question in the TDD.
+        uploads are a deliberate open question.
 
         '
       x-streaming-upload: true

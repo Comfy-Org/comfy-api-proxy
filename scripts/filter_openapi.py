@@ -70,6 +70,12 @@ _INTERNAL_TEXT_PATTERNS = [
     re.compile(r"https?://(?:www\.)?notion\.so/\S+", re.IGNORECASE),
     re.compile(r"\brunpod\b", re.IGNORECASE),
     re.compile(r"\bservices/[a-z0-9_-]+(?:/[a-z0-9_.-]+)*\b", re.IGNORECASE),
+    # Internal design-doc references: "(see the Comfy SDK TDD ...)", "in the
+    # TDD", or a bare "Comfy SDK TDD" mention. The design doc is internal; the
+    # public contract shouldn't point at it.
+    re.compile(r"\s*\(see the Comfy SDK TDD[^)]*\)", re.IGNORECASE),
+    re.compile(r"\s+in the TDD\b", re.IGNORECASE),
+    re.compile(r"\bComfy SDK TDD\b", re.IGNORECASE),
 ]
 
 # Markers the post-filter leak guard fails on if found anywhere in the
@@ -80,6 +86,8 @@ _LEAK_GUARD_PATTERNS = [
     re.compile(r"\b(?:BE|ENG|INFRA|SEC)-\d+\b", re.IGNORECASE),
     re.compile(r"notion\.so", re.IGNORECASE),
     re.compile(r"\brunpod\b", re.IGNORECASE),
+    re.compile(r"\bComfy SDK TDD\b", re.IGNORECASE),
+    re.compile(r"\bthe TDD\b", re.IGNORECASE),
 ]
 
 PUBLIC_HEADER = """\
