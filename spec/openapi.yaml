@@ -151,8 +151,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
-        '500':
-          $ref: '#/components/responses/UpstreamError'
   /api/v2/assets/from-hash:
     post:
       operationId: assetFromHash
@@ -217,8 +215,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
-        '500':
-          $ref: '#/components/responses/UpstreamError'
   /api/v2/assets/by-hash/{hash}:
     head:
       operationId: headAssetByHash
@@ -237,8 +233,6 @@ paths:
           description: No blob the caller may mint from.
         '401':
           $ref: '#/components/responses/Unauthorized'
-        '500':
-          $ref: '#/components/responses/UpstreamError'
   /api/v2/assets/{id}:
     get:
       operationId: getAsset
@@ -262,8 +256,6 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
-        '500':
-          $ref: '#/components/responses/UpstreamError'
   /api/v2/assets/{id}/content:
     get:
       operationId: getAssetContent
@@ -317,8 +309,6 @@ paths:
           $ref: '#/components/responses/NotFound'
         '416':
           description: Range not satisfiable.
-        '500':
-          $ref: '#/components/responses/UpstreamError'
   /api/v2/jobs:
     post:
       operationId: postJobs
@@ -420,8 +410,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
-        '500':
-          $ref: '#/components/responses/UpstreamError'
   /api/v2/jobs/{id}:
     get:
       operationId: getJob
@@ -454,8 +442,6 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
-        '500':
-          $ref: '#/components/responses/UpstreamError'
   /api/v2/jobs/{id}/events:
     get:
       operationId: getJobEvents
@@ -520,27 +506,6 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
-        '429':
-          description: '`too_many_streams` — the caller already has the maximum number of
-            concurrent GET .../events streams open. Close an existing stream (or wait for
-            one to reach a terminal status) before opening another; GET /api/v2/jobs/{id}
-            remains available as a plain poll regardless of this limit.'
-          headers:
-            Retry-After:
-              $ref: '#/components/headers/RetryAfter'
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorEnvelope'
-        '501':
-          description: '`not_implemented` — this deployment does not yet serve live event
-            streaming. GET /api/v2/jobs/{id} remains available as a plain poll in the meantime.'
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorEnvelope'
-        '500':
-          $ref: '#/components/responses/UpstreamError'
   /api/v2/jobs/{id}/cancel:
     post:
       operationId: cancelJob
@@ -574,8 +539,6 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
-        '500':
-          $ref: '#/components/responses/UpstreamError'
 components:
   securitySchemes:
     bearerAuth:
@@ -640,17 +603,6 @@ components:
             $ref: '#/components/schemas/ErrorEnvelope'
     NotFound:
       description: '`not_found`.'
-      content:
-        application/json:
-          schema:
-            $ref: '#/components/schemas/ErrorEnvelope'
-    UpstreamError:
-      description: '`upstream_error` — an unexpected failure reaching or processing the request
-        in this implementation''s backing services. The message is always a generic, safe-to-display
-        string; implementation detail (the specific upstream, its error text, transport failures)
-        is never included here — see each implementation''s own error-mapping notes. Added
-        additively: every operation in this contract can fail this way and none originally
-        declared it.'
       content:
         application/json:
           schema:
@@ -758,17 +710,12 @@ components:
           nullable: true
         metrics:
           type: object
-          description: 'Values are nullable (a metric not yet available — e.g. `execution_ms`
-            before a job starts running — is `null`, not omitted); the example below is deliberately
-            all-non-null purely to work around a Spectral/nimma lint-tooling crash on a literal
-            `null` inside a schema `example` combined with `additionalProperties.nullable:
-            true` — the schema itself is unchanged and still allows null values at runtime.'
           additionalProperties:
             type: integer
             nullable: true
           example:
             queue_ms: 9000
-            execution_ms: 42000
+            execution_ms: null
         urls:
           $ref: '#/components/schemas/JobUrls'
     JobStatus:

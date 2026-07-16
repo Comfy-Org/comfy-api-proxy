@@ -244,8 +244,6 @@ class Job(BaseModel):
     outputs: list[Output]
     error: JobError
     metrics: dict[str, int] | None = Field(
-        None,
-        description='Values are nullable (a metric not yet available — e.g. `execution_ms` before a job starts running — is `null`, not omitted); the example below is deliberately all-non-null purely to work around a Spectral/nimma lint-tooling crash on a literal `null` inside a schema `example` combined with `additionalProperties.nullable: true` — the schema itself is unchanged and still allows null values at runtime.',
-        examples=[{'queue_ms': 9000, 'execution_ms': 42000}],
+        None, examples=[{'queue_ms': 9000, 'execution_ms': None}]
     )
     urls: JobUrls
