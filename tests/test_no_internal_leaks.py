@@ -43,6 +43,8 @@ _LEAK_PATTERNS = [
     re.compile(r"\bthe TDD\b"),
     re.compile(r"\bopenapi-project\b"),
     re.compile(r"\bserverless gateway\b", re.IGNORECASE),
+    # The private upstream monorepo slug — naming it reveals a private repo.
+    re.compile(r"Comfy-Org/cloud\b"),
 ]
 
 
@@ -62,6 +64,12 @@ def _files_to_scan() -> list[Path]:
                 continue
             if p.suffix not in _TEXT_SUFFIXES:
                 continue
+            files.append(p)
+    # Root-level developer-facing docs (README.md et al.) live outside the
+    # scanned dirs but are exactly where an internal reference is most likely to
+    # slip in unnoticed — scan them too.
+    for p in REPO_ROOT.glob("*.md"):
+        if p.is_file() and p not in _EXEMPT:
             files.append(p)
     return files
 

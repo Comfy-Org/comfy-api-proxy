@@ -87,12 +87,13 @@ def _iso(dt: datetime) -> str:
 
 
 def _external_base(request: web.Request) -> str:
-    """The absolute base URL clients reached us on, honoring a reverse proxy's
-    forwarded scheme/host. Content and job links are built from this so the
-    contract's absolute-URI fields (Output.url / Asset.url) are actually
-    absolute — and so a client on http://host:port follows links back to the
-    same origin. aiohttp already reads X-Forwarded-* when the app is created
-    with forwarded_relaxed handling; request.scheme/host reflect it."""
+    """The absolute base URL clients reached us on, from the request's scheme and
+    Host header. Content and job links are built from this so the contract's
+    absolute-URI fields (Output.url / Asset.url) are actually absolute — and so a
+    client on http://host:port follows links back to the same origin. No
+    X-Forwarded-* handling is wired, so those headers are ignored (a client can't
+    point the emitted links at another origin); front this with a TLS terminator
+    only if you add explicit forwarded-header trust."""
     return f"{request.scheme}://{request.host}"
 
 
