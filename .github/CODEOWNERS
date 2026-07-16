@@ -1,0 +1,4 @@
+# Default owners for everything in the repo. A pull request that touches any
+# file requires an approving review from at least one member of these teams
+# (enforced by the "Requirements to Merge to Main" ruleset).
+* @Comfy-Org/comfy-cloud-team @Comfy-Org/core-engine-team
