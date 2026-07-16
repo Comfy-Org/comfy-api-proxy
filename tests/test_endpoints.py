@@ -32,6 +32,17 @@ def _poll_until_terminal(stack, job, timeout=15.0):
     return job
 
 
+def test_job_id_is_a_valid_uuid(stack):
+    # ComfyUI's POST /prompt requires prompt_id to be a canonical UUID; the
+    # proxy reuses the job id as prompt_id, so the job id must be a UUID.
+    import uuid as _uuid
+
+    wf = {"9": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}}}
+    status, job, raw = stack.request("POST", "/api/v2/jobs", {"workflow": wf})
+    assert status == 201, raw
+    _uuid.UUID(job["id"])  # raises if not a valid UUID
+
+
 def test_job_and_output_urls_are_absolute(stack):
     # The contract types Output.url / Asset.url as absolute URIs (format: uri)
     # and job.urls.* must be followable as-is. A relative url here makes a

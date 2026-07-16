@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import struct
+import uuid
 
 from aiohttp import WSMsgType, web
 
@@ -66,6 +67,17 @@ async def prompt(request: web.Request) -> web.Response:
     # below can honor the same scoped-delivery contract instead of just
     # blasting events at whichever job happens to be running.
     client_id = body.get("client_id")
+    # Real ComfyUI rejects a non-UUID prompt_id (server.py validates it), so a
+    # proxy that mints its own id must mint a canonical UUID. Enforce it here
+    # too, otherwise this class of bug stays invisible against the fake.
+    try:
+        uuid.UUID(str(prompt_id))
+    except (ValueError, TypeError):
+        return web.json_response(
+            {"error": {"type": "invalid_prompt", "message": "prompt_id must be a valid UUID"},
+             "node_errors": {}},
+            status=400,
+        )
     graph = body.get("prompt", {})
     if not graph:
         return web.json_response(

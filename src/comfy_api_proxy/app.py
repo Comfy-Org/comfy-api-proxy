@@ -30,6 +30,7 @@ import mimetypes
 import os
 import posixpath
 import tempfile
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -406,7 +407,10 @@ class Proxy:
                 missing_ids=missing,
             )
 
-        job_id = "job_" + os.urandom(12).hex()
+        # ComfyUI's POST /prompt requires prompt_id to be a canonical UUID
+        # (server.py rejects anything else). We reuse the job id verbatim as
+        # prompt_id and client_id, so the job id must itself be a UUID.
+        job_id = str(uuid.uuid4())
         # A per-job client_id, not a fixed one shared by every submission.
         # ComfyUI addresses progress/preview/executing/executed/
         # execution_success/error/interrupted WS events at the client_id

@@ -155,7 +155,7 @@ def test_submit_poll_download_roundtrip(servers):
             f"job {job_id} did not finish within {JOB_TIMEOUT}s (last status: {job['status']!r})"
         )
         time.sleep(0.2)
-        status, job, raw = _request("GET", f"{PROXY_BASE}{job['urls']['self']}")
+        status, job, raw = _request("GET", job["urls"]["self"])
         assert status == 200, f"get_job failed ({status}): {raw!r}"
 
     assert job["status"] == "succeeded", f"job did not succeed: {job.get('error')}"
@@ -163,7 +163,7 @@ def test_submit_poll_download_roundtrip(servers):
 
     # 3. Download the output content and assert it is a real, non-empty PNG.
     output = job["outputs"][0]
-    status, _parsed, content = _request("GET", f"{PROXY_BASE}{output['url']}")
+    status, _parsed, content = _request("GET", output["url"])
     assert status == 200, f"download failed ({status})"
     assert content, "downloaded output is empty"
     assert content.startswith(b"\x89PNG\r\n\x1a\n"), "downloaded output is not a PNG"
