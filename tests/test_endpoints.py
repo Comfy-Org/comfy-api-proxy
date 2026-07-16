@@ -32,6 +32,24 @@ def _poll_until_terminal(stack, job, timeout=15.0):
     return job
 
 
+def test_job_and_output_urls_are_absolute(stack):
+    # The contract types Output.url / Asset.url as absolute URIs (format: uri)
+    # and job.urls.* must be followable as-is. A relative url here makes a
+    # strict SDK model reject the response, so guard that they are absolute and
+    # point back at the surface the client reached us on.
+    wf = {"9": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}}}
+    _, job, raw = stack.request("POST", "/api/v2/jobs", {"workflow": wf})
+    assert job["urls"]["self"] == f"{stack.base}/api/v2/jobs/{job['id']}"
+    assert job["urls"]["events"].startswith(f"{stack.base}/")
+    assert job["urls"]["cancel"].startswith(f"{stack.base}/")
+    job = _poll_until_terminal(stack, job)
+    assert job["status"] == "succeeded", job
+    assert job["outputs"], job
+    for out in job["outputs"]:
+        assert out["url"].startswith(f"{stack.base}/api/v2/assets/"), out["url"]
+        assert out["url"].endswith("/content")
+
+
 def test_upload_asset_returns_asset_shape(stack):
     status, asset, raw = stack.upload("cat.png", _PNG, "image/png", tags="input")
     assert status == 201, raw
@@ -40,7 +58,7 @@ def test_upload_asset_returns_asset_shape(stack):
     assert asset["size_bytes"] == len(_PNG)
     assert asset["content_type"] == "image/png"
     assert asset["created_new"] is True
-    assert asset["url"] == f"/api/v2/assets/{asset['id']}/content"
+    assert asset["url"] == f"{stack.base}/api/v2/assets/{asset['id']}/content"
 
 
 def test_upload_dedups_identical_bytes(stack):

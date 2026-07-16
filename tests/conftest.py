@@ -132,7 +132,10 @@ class Stack:
     def read_sse(self, path: str, timeout: float = 20.0) -> list[tuple[str, Any]]:
         """Read an SSE stream to completion, returning [(event, data), ...].
         The server closes the stream at the terminal status, ending the read."""
-        req = urllib.request.Request(self.base + path, method="GET")
+        # Follow the server-provided link as-is when it is absolute (the API
+        # now returns absolute urls.* per the contract); only join a bare path.
+        url = self.base + path if path.startswith("/") else path
+        req = urllib.request.Request(url, method="GET")
         events: list[tuple[str, Any]] = []
         with urllib.request.urlopen(req, timeout=timeout) as r:
             event_name = "message"

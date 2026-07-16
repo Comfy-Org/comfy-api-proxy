@@ -85,6 +85,16 @@ def _iso(dt: datetime) -> str:
     return dt.isoformat()
 
 
+def _external_base(request: web.Request) -> str:
+    """The absolute base URL clients reached us on, honoring a reverse proxy's
+    forwarded scheme/host. Content and job links are built from this so the
+    contract's absolute-URI fields (Output.url / Asset.url) are actually
+    absolute — and so a client on http://host:port follows links back to the
+    same origin. aiohttp already reads X-Forwarded-* when the app is created
+    with forwarded_relaxed handling; request.scheme/host reflect it."""
+    return f"{request.scheme}://{request.host}"
+
+
 def _b64url_decode(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
@@ -201,7 +211,7 @@ class Proxy:
             return r.status, body
 
     # -- job status mapping --------------------------------------------------
-    async def _status_of(self, job_id: str) -> dict[str, Any]:
+    async def _status_of(self, job_id: str, base: str) -> dict[str, Any]:
         # 1) Terminal? history holds completed/failed jobs with their outputs.
         st, hist = await self._get_json(f"/history/{job_id}")
         if st == 200 and isinstance(hist, dict) and job_id in hist:
@@ -213,12 +223,12 @@ class Proxy:
                 ev == "execution_interrupted" for ev, _ in messages if isinstance(ev, str)
             )
             if interrupted:
-                return {"status": "canceled", "outputs": self._outputs(entry)}
+                return {"status": "canceled", "outputs": self._outputs(entry, base)}
             if status_str == "success":
-                return {"status": "succeeded", "outputs": self._outputs(entry)}
+                return {"status": "succeeded", "outputs": self._outputs(entry, base)}
             return {
                 "status": "failed",
-                "outputs": self._outputs(entry),
+                "outputs": self._outputs(entry, base),
                 "error": self._error_from(entry),
             }
         # 2) Not terminal: is it running or still queued?
@@ -246,7 +256,7 @@ class Proxy:
         # schema-valid running snapshot. The SSE stream carries the live one.
         return {"value": 0.0, "nodes_done": 0, "nodes_total": 0}
 
-    def _outputs(self, entry: dict[str, Any]) -> list[dict[str, Any]]:
+    def _outputs(self, entry: dict[str, Any], base: str) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         for node_id, node_out in (entry.get("outputs") or {}).items():
             for key, items in node_out.items():
@@ -270,7 +280,7 @@ class Proxy:
                             "size_bytes": 0,
                             "id": aid,
                             "hash": None,
-                            "url": f"/api/v2/assets/{aid}/content",
+                            "url": f"{base}/api/v2/assets/{aid}/content",
                             "url_expires_at": _iso(now + _RETENTION),
                         }
                     )
@@ -294,7 +304,7 @@ class Proxy:
             "traceback": None,
         }
 
-    def _job(self, job_id: str, state: dict[str, Any]) -> dict[str, Any]:
+    def _job(self, job_id: str, state: dict[str, Any], base: str) -> dict[str, Any]:
         meta = self._jobs.get(job_id, {})
         created = meta.get("created_at", _now())
         status = state["status"]
@@ -312,9 +322,9 @@ class Proxy:
             "outputs": state.get("outputs", []),
             "error": state.get("error"),
             "urls": {
-                "self": f"/api/v2/jobs/{job_id}",
-                "events": f"/api/v2/jobs/{job_id}/events",
-                "cancel": f"/api/v2/jobs/{job_id}/cancel",
+                "self": f"{base}/api/v2/jobs/{job_id}",
+                "events": f"{base}/api/v2/jobs/{job_id}/events",
+                "cancel": f"{base}/api/v2/jobs/{job_id}/cancel",
             },
         }
 
@@ -419,21 +429,26 @@ class Proxy:
                 msg = (data.get("error") or {}).get("message", "Workflow rejected.")
                 return _error(422, "invalid_workflow", msg, node_errors=node_errors)
         self._jobs[job_id] = {"workflow": workflow, "created_at": _now(), "client_id": job_id}
-        return web.json_response(self._job(job_id, {"status": "queued", "outputs": []}), status=201)
+        base = _external_base(request)
+        return web.json_response(
+            self._job(job_id, {"status": "queued", "outputs": []}, base), status=201
+        )
 
     async def get_job(self, request: web.Request) -> web.Response:
         job_id = request.match_info["id"]
-        state = await self._status_of(job_id)
+        base = _external_base(request)
+        state = await self._status_of(job_id, base)
         if state["status"] == "unknown" and job_id not in self._jobs:
             return _error(404, "not_found", f"No job {job_id}.")
-        return web.json_response(self._job(job_id, state))
+        return web.json_response(self._job(job_id, state, base))
 
     async def cancel_job(self, request: web.Request) -> web.Response:
         job_id = request.match_info["id"]
+        base = _external_base(request)
         if job_id not in self._jobs:
             # Allow cancel of an id ComfyUI still knows even if the proxy
             # restarted; a wholly unknown id is a 404.
-            state = await self._status_of(job_id)
+            state = await self._status_of(job_id, base)
             if state["status"] == "unknown":
                 return _error(404, "not_found", f"No job {job_id}.")
         # ComfyUI's atomic per-id cancel (interrupt-if-running or dequeue).
@@ -442,16 +457,17 @@ class Proxy:
                 await r.read()
         except Exception:
             return _error(500, "upstream_error", "Failed to reach ComfyUI to cancel.")
-        state = await self._status_of(job_id)
+        state = await self._status_of(job_id, base)
         # A cancel of a still-running job reports `canceling` until the
         # interrupt lands at the next node boundary.
         if state["status"] == "running":
             state["status"] = "canceling"
-        return web.json_response(self._job(job_id, state))
+        return web.json_response(self._job(job_id, state, base))
 
     async def job_events(self, request: web.Request) -> web.StreamResponse:
         job_id = request.match_info["id"]
-        state = await self._status_of(job_id)
+        base = _external_base(request)
+        state = await self._status_of(job_id, base)
         if state["status"] == "unknown" and job_id not in self._jobs:
             return _error(404, "not_found", f"No job {job_id}.")
         if self._open_streams >= _MAX_CONCURRENT_STREAMS:
@@ -475,8 +491,8 @@ class Proxy:
         await response.prepare(request)
 
         async def snapshot() -> dict[str, Any]:
-            snap = await self._status_of(job_id)
-            job = self._job(job_id, snap)
+            snap = await self._status_of(job_id, base)
+            job = self._job(job_id, snap, base)
             return {
                 "status": job["status"],
                 "queue_position": job["queue_position"],
@@ -507,6 +523,7 @@ class Proxy:
 
     # ==== asset handlers ====================================================
     async def upload_asset(self, request: web.Request) -> web.Response:
+        base = _external_base(request)
         if not request.content_type.startswith("multipart/"):
             return _error(422, "invalid_request", "Expected multipart/form-data.")
         try:
@@ -587,7 +604,9 @@ class Proxy:
             # Dedup fast-path: bytes we already have -> return existing asset.
             existing = self.assets.get_by_hash(computed_hash)
             if existing is not None:
-                return web.json_response(self._asset_json(existing, created_new=False), status=200)
+                return web.json_response(
+                    self._asset_json(existing, created_new=False, base=base), status=200
+                )
 
             with open(tmp_path, "rb") as f:
                 data = f.read()
@@ -603,7 +622,9 @@ class Proxy:
             if err is not None:
                 return err
             assert record is not None
-            return web.json_response(self._asset_json(record, created_new=True), status=201)
+            return web.json_response(
+                self._asset_json(record, created_new=True, base=base), status=201
+            )
         finally:
             if tmp_path is not None:
                 with contextlib.suppress(OSError):
@@ -723,7 +744,10 @@ class Proxy:
             return _error(404, "blob_not_found", "No blob the caller may mint from.")
         # Single-user self-hosted: minting a second reference over the same
         # blob returns the same asset (the reference already exists).
-        return web.json_response(self._asset_json(record, created_new=False), status=200)
+        base = _external_base(request)
+        return web.json_response(
+            self._asset_json(record, created_new=False, base=base), status=200
+        )
 
     async def head_asset_by_hash(self, request: web.Request) -> web.Response:
         hash_ = request.match_info["hash"]
@@ -733,9 +757,10 @@ class Proxy:
 
     async def get_asset(self, request: web.Request) -> web.Response:
         asset_id = request.match_info["id"]
+        base = _external_base(request)
         record = self.assets.get(asset_id)
         if record is not None:
-            return web.json_response(self._asset_json(record, created_new=None))
+            return web.json_response(self._asset_json(record, created_new=None, base=base))
         decoded = self._decode_asset_id(asset_id)
         if decoded is not None:
             now = _now()
@@ -748,7 +773,7 @@ class Proxy:
                     "content_type": ctype,
                     "file_path": decoded["f"],
                     "created_at": _iso(now),
-                    "url": f"/api/v2/assets/{asset_id}/content",
+                    "url": f"{base}/api/v2/assets/{asset_id}/content",
                     "url_expires_at": _iso(now + _RETENTION),
                 }
             )
@@ -800,7 +825,9 @@ class Proxy:
         await out.write_eof()
         return out
 
-    def _asset_json(self, record: AssetRecord, *, created_new: bool | None) -> dict[str, Any]:
+    def _asset_json(
+        self, record: AssetRecord, *, created_new: bool | None, base: str
+    ) -> dict[str, Any]:
         now = _now()
         body: dict[str, Any] = {
             "id": record.id,
@@ -809,7 +836,7 @@ class Proxy:
             "content_type": record.content_type,
             "file_path": record.file_path,
             "created_at": record.created_at,
-            "url": f"/api/v2/assets/{record.id}/content",
+            "url": f"{base}/api/v2/assets/{record.id}/content",
             "url_expires_at": _iso(now + _RETENTION),
         }
         if created_new is not None:
