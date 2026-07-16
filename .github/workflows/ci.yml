@@ -54,6 +54,37 @@ jobs:
       - name: mypy
         run: mypy src/comfy_api_proxy
 
+  spec-drift:
+    name: Spec-drift check (models match spec/openapi.yaml)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package + dev tools
+        run: pip install -e ".[dev]"
+
+      # Regenerate the pydantic models from the checked-in spec/openapi.yaml
+      # into the real output path, then diff against git HEAD. A non-empty
+      # diff means someone synced the spec (or hand-edited the generated
+      # file) without regenerating models — fail the build rather than let
+      # the two drift apart silently.
+      - name: Regenerate models and diff against checked-in copy
+        run: |
+          python3 scripts/generate_models.py
+          if ! git diff --exit-code -- src/comfy_api_proxy/schemas/_generated.py; then
+            echo "::error::src/comfy_api_proxy/schemas/_generated.py is out of date." \
+                 "Run 'python3 scripts/generate_models.py' and commit the result."
+            exit 1
+          fi
+          echo "OK: generated models match spec/openapi.yaml."
+
   test:
     name: Test + e2e smoke (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest

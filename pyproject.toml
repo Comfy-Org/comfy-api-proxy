@@ -3,13 +3,22 @@ name = "comfy-api-proxy"
 version = "0.0.1"
 description = "Local proxy exposing the Comfy API v2 in front of a self-hosted ComfyUI instance."
 requires-python = ">=3.10"
-dependencies = ["aiohttp>=3.9"]
+dependencies = [
+    "aiohttp>=3.9",
+    "blake3>=0.4",
+    "pydantic>=2.6",
+    "PyYAML>=6.0",
+]
 
 [project.optional-dependencies]
 dev = [
     "ruff>=0.6",
     "mypy>=1.10",
     "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-aiohttp>=1.0",
+    "datamodel-code-generator>=0.68,<0.69",
+    "jsonschema>=4.0",
 ]
 
 [project.scripts]
@@ -24,6 +33,7 @@ packages = ["src/comfy_api_proxy"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 100
