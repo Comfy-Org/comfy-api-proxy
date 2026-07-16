@@ -74,8 +74,10 @@ async def prompt(request: web.Request) -> web.Response:
         uuid.UUID(str(prompt_id))
     except (ValueError, TypeError):
         return web.json_response(
-            {"error": {"type": "invalid_prompt", "message": "prompt_id must be a valid UUID"},
-             "node_errors": {}},
+            {
+                "error": {"type": "invalid_prompt", "message": "prompt_id must be a valid UUID"},
+                "node_errors": {},
+            },
             status=400,
         )
     graph = body.get("prompt", {})

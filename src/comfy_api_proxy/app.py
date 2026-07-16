@@ -749,9 +749,7 @@ class Proxy:
         # Single-user self-hosted: minting a second reference over the same
         # blob returns the same asset (the reference already exists).
         base = _external_base(request)
-        return web.json_response(
-            self._asset_json(record, created_new=False, base=base), status=200
-        )
+        return web.json_response(self._asset_json(record, created_new=False, base=base), status=200)
 
     async def head_asset_by_hash(self, request: web.Request) -> web.Response:
         hash_ = request.match_info["hash"]
