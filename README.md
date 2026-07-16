@@ -232,8 +232,18 @@ Implemented: submit (with `core/ASSET` resolution), poll, cancel, live SSE
 events, asset upload/download, from-hash/by-hash dedup, and guarded
 model-directory placement.
 
-Known limitations: the asset index and job store are in-memory only (lost on
-restart, same as ComfyUI's own history); the `Idempotency-Key` header
-documented in the contract is not yet implemented (a retried request is not
-deduped or replayed — it submits again); large uploads are read fully into
-memory/a temp file rather than true zero-copy streaming.
+Known limitations:
+
+- **State is in-memory only.** The asset index and job store live in memory (as
+  does ComfyUI's own history), so all state is lost on restart. A job id or asset
+  id issued before a restart no longer resolves afterward — this includes the
+  HMAC-signed stateless output ids, since the signing secret is regenerated per
+  process. A client that persists an id across a proxy restart must expect a 404;
+  a durable store is a follow-up.
+- **`Idempotency-Key` is accepted but not yet enforced.** The header documented
+  in the contract is not rejected (the SDK sends one on every submit), but there
+  is no dedup/replay yet — a retried request runs again. Stakes are lower than a
+  billed surface, but don't rely on it for exactly-once until the durable store
+  lands.
+- **Uploads are not zero-copy.** Large uploads are read fully into memory / a
+  temp file rather than true streaming.

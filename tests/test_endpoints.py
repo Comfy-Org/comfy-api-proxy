@@ -159,6 +159,20 @@ def test_unresolvable_asset_ref_rejected(stack):
     assert body["error"]["code"] == "missing_asset"
 
 
+def test_malformed_asset_ref_rejected_not_forwarded(stack):
+    # A node tagged core/ASSET but with a missing or non-object `info` must be
+    # rejected with 422 missing_asset, not forwarded to ComfyUI as a literal dict.
+    for bad in (
+        {"__type": "core/ASSET"},
+        {"__type": "core/ASSET", "info": "nope"},
+        {"__type": "core/ASSET", "info": {}},
+    ):
+        workflow = {"1": {"class_type": "LoadImage", "inputs": {"image": bad}}}
+        status, body, raw = stack.request("POST", "/api/v2/jobs", {"workflow": workflow})
+        assert status == 422, f"{bad!r} -> {raw!r}"
+        assert body["error"]["code"] == "missing_asset", raw
+
+
 def test_ui_format_workflow_rejected(stack):
     status, body, _ = stack.request(
         "POST", "/api/v2/jobs", {"workflow": {"nodes": [], "links": []}}

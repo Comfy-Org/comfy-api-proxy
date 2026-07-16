@@ -109,11 +109,13 @@ def _is_ui_format(workflow: dict[str, Any]) -> bool:
 
 
 def _is_asset_ref(value: Any) -> bool:
-    return (
-        isinstance(value, dict)
-        and value.get("__type") == "core/ASSET"
-        and isinstance(value.get("info"), dict)
-    )
+    """A node that claims to be a core/ASSET reference by its ``__type`` tag.
+
+    Whether its ``info`` block is well-formed is deliberately NOT checked here:
+    a node tagged ``core/ASSET`` is always treated as an (attempted) reference so
+    a malformed one is rejected with 422 ``missing_asset`` rather than forwarded
+    to ComfyUI verbatim as a literal dict (see ``_rewrite_asset_refs``)."""
+    return isinstance(value, dict) and value.get("__type") == "core/ASSET"
 
 
 class Proxy:
@@ -365,9 +367,15 @@ class Proxy:
         """Recursively replace core/ASSET refs in a workflow with the
         filename string ComfyUI expects, collecting unresolvable ids."""
         if _is_asset_ref(node):
-            resolved = self._resolve_asset_ref(node["info"])
+            info = node.get("info")
+            if not isinstance(info, dict):
+                # Tagged core/ASSET but with no (or a non-object) info block —
+                # unresolvable. Reject rather than forward the raw dict.
+                missing.append("<malformed core/ASSET: missing info>")
+                return node
+            resolved = self._resolve_asset_ref(info)
             if resolved is None:
-                missing.append(str(node["info"].get("id", "<no id>")))
+                missing.append(str(info.get("id", "<no id>")))
                 return node
             return resolved
         if isinstance(node, dict):
