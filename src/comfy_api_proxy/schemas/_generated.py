@@ -137,7 +137,7 @@ class ErrorEnvelope(BaseModel):
     Shared error envelope with machine-readable codes. Core codes (v1):
     `invalid_workflow` (422), `workflow_format_ui` (422),
     `missing_asset` (422), `hash_mismatch` (409), `blob_not_found`
-    (404), `idempotency_key_reuse` (422), `idempotency_conflict` (409),
+    (404), `idempotency_key_reuse` (422), `invalid_request` (400),
     `queue_full` (429 + Retry-After), `insufficient_credits` (402),
     `not_found` (404), `unauthorized` (401), `forbidden` (403).
 
