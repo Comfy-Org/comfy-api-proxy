@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import collections
 import contextlib
 import hashlib
 import hmac
@@ -68,6 +69,15 @@ _DEFAULT_MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 _MAX_CONCURRENT_STREAMS = 8
 
 _RETENTION = timedelta(hours=24)
+
+# Idempotency-Key bounds. A per-instance self-hosted proxy holds claimed keys
+# in memory, so cap both the length of any single key and the total number
+# retained — otherwise a caller could grow the set without bound (memory
+# exhaustion) by sending unique, arbitrarily long keys. Past the count cap the
+# oldest claim is evicted (FIFO); the window is generous enough to cover any
+# realistic retry horizon for a single-instance proxy.
+_MAX_IDEMPOTENCY_KEY_LEN = 255
+_MAX_IDEMPOTENCY_KEYS = 10_000
 
 
 def _error(status: int, code: str, message: str, **details: Any) -> web.Response:
@@ -157,10 +167,12 @@ class Proxy:
         # job_id -> {"workflow": ..., "created_at": datetime, "client_id": str}
         self._jobs: dict[str, dict[str, Any]] = {}
         # Claimed Idempotency-Key values (single-use, reject-on-duplicate — no
-        # replay, matching the v2 contract). In-memory and unbounded, which is
-        # fine for a per-instance self-hosted proxy: keys live for the process
-        # lifetime and a restart clears them, exactly like _jobs above.
-        self._idempotency_keys: set[str] = set()
+        # replay, matching the v2 contract). In-memory for a per-instance
+        # self-hosted proxy: keys live for the process lifetime and a restart
+        # clears them. Bounded in size (see _MAX_IDEMPOTENCY_KEYS) with FIFO
+        # eviction; an OrderedDict is used as an ordered set so the oldest
+        # claim can be popped when the cap is reached.
+        self._idempotency_keys: collections.OrderedDict[str, None] = collections.OrderedDict()
         self._session: ClientSession | None = None
         self._open_streams = 0
         # Per-process secret used to HMAC-sign stateless output asset ids
@@ -476,7 +488,16 @@ class Proxy:
         # unknown outcome (ComfyUI unreachable — it may already hold the prompt)
         # the key is HELD so a same-key retry can't double-submit.
         key = request.headers.get("Idempotency-Key")
-        if key:
+        if key is not None:
+            # A present-but-empty header is malformed input, not "no key"; and
+            # cap the length so a caller can't grow the in-memory set with an
+            # arbitrarily long key.
+            if not key or len(key) > _MAX_IDEMPOTENCY_KEY_LEN:
+                return _error(
+                    400,
+                    "invalid_request",
+                    f"Idempotency-Key must be 1-{_MAX_IDEMPOTENCY_KEY_LEN} characters.",
+                )
             if key in self._idempotency_keys:
                 return _error(
                     422,
@@ -484,7 +505,9 @@ class Proxy:
                     "This Idempotency-Key has already been used. Keys are single-use; "
                     "poll or list your jobs instead of resubmitting with the same key.",
                 )
-            self._idempotency_keys.add(key)
+            self._idempotency_keys[key] = None
+            if len(self._idempotency_keys) > _MAX_IDEMPOTENCY_KEYS:
+                self._idempotency_keys.popitem(last=False)  # evict oldest (FIFO)
 
         payload = {
             "prompt": resolved_workflow,
@@ -493,16 +516,23 @@ class Proxy:
         }
         try:
             async with self.session.post(self.comfyui + "/prompt", json=payload) as r:
-                data = await r.json() if r.content_type == "application/json" else {}
                 if r.status != 200:
+                    # A definite non-200 means ComfyUI created no job. Release
+                    # the key for a retry based on the status ALONE, before
+                    # reading the body — a failed body read must not turn a
+                    # definite rejection into a (wrongly) held key.
                     if key:
-                        self._idempotency_keys.discard(
-                            key
-                        )  # ComfyUI rejected it — no job; release for a retry
+                        self._idempotency_keys.pop(key, None)
+                    try:
+                        data = await r.json() if r.content_type == "application/json" else {}
+                    except (ClientError, asyncio.TimeoutError, ValueError):
+                        data = {}
                     node_errors = data.get("node_errors") or {}
                     msg = (data.get("error") or {}).get("message", "Workflow rejected.")
                     return _error(422, "invalid_workflow", msg, node_errors=node_errors)
         except (ClientError, asyncio.TimeoutError):
+            # Unknown outcome — ComfyUI may already hold the prompt. HOLD the
+            # key (do not release) so a same-key retry can't double-submit.
             return _error(503, "upstream_unreachable", "Could not reach ComfyUI to submit the job.")
         self._jobs[job_id] = {"workflow": workflow, "created_at": _now(), "client_id": job_id}
         base = _external_base(request)

@@ -136,10 +136,7 @@ paths:
         '403':
           $ref: '#/components/responses/Forbidden'
         '409':
-          description: '`hash_mismatch` or `idempotency_conflict`.'
-          headers:
-            Retry-After:
-              $ref: '#/components/headers/RetryAfter'
+          description: '`hash_mismatch`.'
           content:
             application/json:
               schema:
@@ -330,17 +327,19 @@ paths:
         rejected with `workflow_format_ui`.
 
 
-        `Idempotency-Key` follows Stripe semantics: a retry with the same
+        `Idempotency-Key` is single-use (reject-on-duplicate): the first use
 
-        key and body replays the recorded response (`Idempotency-Replayed:
+        of a key claims it; any reuse returns `422` `idempotency_key_reuse`.
 
-        true`, same job, no second execution); same key with a different
+        The claim is released only if the submission was definitively rejected
 
-        body is `422` `idempotency_key_reuse`; a concurrent retry while the
+        (no job created); on an ambiguous outcome (the upstream was
 
-        first is in flight is `409` with `Retry-After`. Keys expire after
+        unreachable) it is held so a retry cannot double-submit. Keys are held
 
-        24h.
+        in memory for the process lifetime — there is no replay and no
+
+        cross-restart persistence yet.
 
 
         Reserved for post-MVP and rejected if present today: `webhook_url`,
@@ -367,9 +366,6 @@ paths:
       responses:
         '201':
           description: Job created and queued.
-          headers:
-            Idempotency-Replayed:
-              $ref: '#/components/headers/IdempotencyReplayed'
           content:
             application/json:
               schema:
@@ -384,15 +380,6 @@ paths:
                 $ref: '#/components/schemas/ErrorEnvelope'
         '403':
           $ref: '#/components/responses/Forbidden'
-        '409':
-          description: '`idempotency_conflict` — concurrent retry in flight.'
-          headers:
-            Retry-After:
-              $ref: '#/components/headers/RetryAfter'
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorEnvelope'
         '422':
           description: '`invalid_workflow` (with per-node details), `workflow_format_ui`,
             `missing_asset`, or `idempotency_key_reuse`.'
@@ -553,8 +540,9 @@ components:
       required: false
       schema:
         type: string
-      description: Client-generated UUID (recommended). Stripe semantics; keys expire after
-        24h.
+      description: 'Client-generated UUID (recommended). Single-use, reject-on-duplicate —
+        a reused key returns `422` `idempotency_key_reuse`. Held in memory for the process
+        lifetime; no replay, no cross-restart persistence yet.'
     JobId:
       name: id
       in: path
@@ -582,11 +570,6 @@ components:
       schema:
         type: integer
       description: Seconds to wait before retrying.
-    IdempotencyReplayed:
-      schema:
-        type: boolean
-      description: '`true` when this response was replayed from a previously recorded request
-        with the same Idempotency-Key.'
   responses:
     Unauthorized:
       description: '`unauthorized` — missing or invalid credentials.'
@@ -877,7 +860,7 @@ components:
 
         `missing_asset` (422), `hash_mismatch` (409), `blob_not_found`
 
-        (404), `idempotency_key_reuse` (422), `idempotency_conflict` (409),
+        (404), `idempotency_key_reuse` (422), `invalid_request` (400),
 
         `queue_full` (429 + Retry-After), `insufficient_credits` (402),
 
