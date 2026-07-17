@@ -613,10 +613,9 @@ def test_model_asset_ref_resolves_to_root_relative_filename(stack_with_models_di
 # 422 mapping: reserved top-level fields and a missing 'workflow' key.
 #
 # test_reserved_fields_rejected (above) only exercises 'webhook_url'; submit()
-# rejects 'inputs' the same way (it isn't accepted until the not-yet-built
-# Idempotency-Key / replay path exists), and a request with no 'workflow' key
-# at all is a distinct code path from both the reserved-field check and the
-# UI-format-graph check.
+# rejects 'inputs' the same way (a reserved field, not accepted in v1), and a
+# request with no 'workflow' key at all is a distinct code path from both the
+# reserved-field check and the UI-format-graph check.
 # ---------------------------------------------------------------------------
 def test_submit_reserved_inputs_field_rejected(stack):
     status, body, raw = stack.request(
@@ -630,6 +629,20 @@ def test_submit_missing_workflow_key_rejected(stack):
     status, body, raw = stack.request("POST", "/api/v2/jobs", {})
     assert status == 422, raw
     assert body["error"]["code"] == "invalid_workflow"
+
+
+def test_idempotency_key_reuse_rejected(stack):
+    # Single-use, reject-on-duplicate (no replay): the first submit with a key
+    # succeeds; a second submit reusing the same key is 422 idempotency_key_reuse;
+    # a different key is accepted.
+    wf = {"workflow": {"1": {"class_type": "Noop", "inputs": {}}}}
+    s1, _, r1 = stack.request("POST", "/api/v2/jobs", wf, headers={"Idempotency-Key": "key-abc"})
+    assert s1 == 201, r1
+    s2, b2, r2 = stack.request("POST", "/api/v2/jobs", wf, headers={"Idempotency-Key": "key-abc"})
+    assert s2 == 422, r2
+    assert b2["error"]["code"] == "idempotency_key_reuse"
+    s3, _, r3 = stack.request("POST", "/api/v2/jobs", wf, headers={"Idempotency-Key": "key-xyz"})
+    assert s3 == 201, r3
 
 
 # ---------------------------------------------------------------------------

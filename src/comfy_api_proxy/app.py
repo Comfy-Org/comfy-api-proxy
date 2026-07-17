@@ -156,6 +156,11 @@ class Proxy:
         self.assets = AssetStore()
         # job_id -> {"workflow": ..., "created_at": datetime, "client_id": str}
         self._jobs: dict[str, dict[str, Any]] = {}
+        # Claimed Idempotency-Key values (single-use, reject-on-duplicate — no
+        # replay, matching the v2 contract). In-memory and unbounded, which is
+        # fine for a per-instance self-hosted proxy: keys live for the process
+        # lifetime and a restart clears them, exactly like _jobs above.
+        self._idempotency_keys: set[str] = set()
         self._session: ClientSession | None = None
         self._open_streams = 0
         # Per-process secret used to HMAC-sign stateless output asset ids
@@ -463,6 +468,24 @@ class Proxy:
         # different client_id) silently gets none. Using job_id itself as
         # the client_id gives each job's own SSE bridge (see job_events,
         # which connects with this same id) a 1:1 addressable target.
+        # Idempotency-Key: single-use, reject-on-duplicate (no replay), matching
+        # the v2 contract. Claim it synchronously (no await between the
+        # membership test and the add) so two concurrent submits with the same
+        # key can't both pass. The claim is released below only if the submit
+        # DEFINITELY created no job (ComfyUI rejected the workflow); on an
+        # unknown outcome (ComfyUI unreachable — it may already hold the prompt)
+        # the key is HELD so a same-key retry can't double-submit.
+        key = request.headers.get("Idempotency-Key")
+        if key:
+            if key in self._idempotency_keys:
+                return _error(
+                    422,
+                    "idempotency_key_reuse",
+                    "This Idempotency-Key has already been used. Keys are single-use; "
+                    "poll or list your jobs instead of resubmitting with the same key.",
+                )
+            self._idempotency_keys.add(key)
+
         payload = {
             "prompt": resolved_workflow,
             "prompt_id": job_id,
@@ -472,6 +495,10 @@ class Proxy:
             async with self.session.post(self.comfyui + "/prompt", json=payload) as r:
                 data = await r.json() if r.content_type == "application/json" else {}
                 if r.status != 200:
+                    if key:
+                        self._idempotency_keys.discard(
+                            key
+                        )  # ComfyUI rejected it — no job; release for a retry
                     node_errors = data.get("node_errors") or {}
                     msg = (data.get("error") or {}).get("message", "Workflow rejected.")
                     return _error(422, "invalid_workflow", msg, node_errors=node_errors)

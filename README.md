@@ -240,10 +240,9 @@ Known limitations:
   HMAC-signed stateless output ids, since the signing secret is regenerated per
   process. A client that persists an id across a proxy restart must expect a 404;
   a durable store is a follow-up.
-- **`Idempotency-Key` is accepted but not yet enforced.** The header documented
-  in the contract is not rejected (the SDK sends one on every submit), but there
-  is no dedup/replay yet — a retried request runs again. Stakes are lower than a
-  billed surface, but don't rely on it for exactly-once until the durable store
-  lands.
+- **`Idempotency-Key` dedup is in-memory.** A reused key is rejected
+  (`422 idempotency_key_reuse` — keys are single-use, no replay), but the claim
+  set lives in the process and is cleared on restart, so a key reused across a
+  proxy restart is not detected. A durable store is a follow-up.
 - **Uploads are not zero-copy.** Large uploads are read fully into memory / a
   temp file rather than true streaming.
