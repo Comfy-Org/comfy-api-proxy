@@ -877,3 +877,42 @@ def test_sse_stream_cap_returns_429_and_frees_slot_when_job_finishes(stack):
         for resp in opened:
             with contextlib.suppress(Exception):
                 resp.close()
+
+
+async def test_asset_content_upstream_5xx_maps_to_502_but_404_stays_404():
+    # A genuine upstream 404 means the output isn't there (-> 404); any other
+    # non-2xx from ComfyUI is an upstream failure (-> 502 upstream_error), not
+    # a "never existed" 404.
+    from aiohttp.test_utils import make_mocked_request
+
+    from comfy_api_proxy.app import Proxy
+
+    class _Resp:
+        def __init__(self, status: int) -> None:
+            self.status = status
+            self.content_type = "image/png"
+            self.headers: dict[str, str] = {}
+
+        def release(self) -> None:
+            pass
+
+    class _Session:
+        def __init__(self, status: int) -> None:
+            self._status = status
+
+        async def get(self, url, params=None, headers=None):  # noqa: ANN001
+            return _Resp(self._status)
+
+    cases = [(500, 502, "upstream_error"), (403, 502, "upstream_error"), (404, 404, "not_found")]
+    for upstream_status, expected_status, expected_code in cases:
+        proxy = Proxy("http://comfy")
+        proxy._session = _Session(upstream_status)  # type: ignore[assignment]
+        rec = proxy.assets.register_comfy_output(
+            filename="out.png", subfolder="", type_="output", content_type="image/png"
+        )
+        req = make_mocked_request(
+            "GET", f"/api/v2/assets/{rec.id}/content", match_info={"id": rec.id}
+        )
+        resp = await proxy.get_asset_content(req)
+        assert resp.status == expected_status, (upstream_status, resp.status)
+        assert json.loads(resp.body)["error"]["code"] == expected_code

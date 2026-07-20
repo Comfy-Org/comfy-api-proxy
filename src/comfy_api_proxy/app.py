@@ -937,8 +937,16 @@ class Proxy:
         except Exception:
             return _error(500, "upstream_error", "Failed to reach ComfyUI for content.")
         if upstream.status not in (200, 206):
+            status = upstream.status
             upstream.release()
-            return _error(404, "not_found", "Output not available upstream.")
+            # A genuine 404 means the output isn't there; any other non-2xx
+            # (a ComfyUI-side 5xx, 403, ...) is an upstream failure, not a
+            # "never existed" — surface it as such instead of masking it as 404.
+            if status == 404:
+                return _error(404, "not_found", "Output not available upstream.")
+            return _error(
+                502, "upstream_error", "ComfyUI returned an unexpected status for the output."
+            )
         out = web.StreamResponse(status=upstream.status)
         out.content_type = upstream.content_type
         for h in ("Content-Length", "Content-Range", "Accept-Ranges"):
