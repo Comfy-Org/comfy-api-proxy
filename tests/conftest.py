@@ -154,7 +154,13 @@ class Stack:
         return events
 
 
-def _make_stack(tmp_path: Path, *, comfyui_base_dir: str | None = None, token: str | None = None):
+def _make_stack(
+    tmp_path: Path,
+    *,
+    comfyui_base_dir: str | None = None,
+    token: str | None = None,
+    max_upload_mb: int | None = None,
+):
     """Spawn fake ComfyUI + the real proxy on free ports; yield a Stack driver."""
     procs: list[tuple[subprocess.Popen, str, Path]] = []
     comfyui_port = _free_port()
@@ -190,6 +196,8 @@ def _make_stack(tmp_path: Path, *, comfyui_base_dir: str | None = None, token: s
         proxy_args += ["--comfyui-base-dir", comfyui_base_dir]
     if token is not None:
         proxy_args += ["--token", token]
+    if max_upload_mb is not None:
+        proxy_args += ["--max-upload-mb", str(max_upload_mb)]
     _spawn(proxy_args, proxy_port, "proxy")
 
     stack = Stack(f"http://127.0.0.1:{proxy_port}", comfyui_port, proxy_port)
@@ -211,6 +219,28 @@ def _make_stack(tmp_path: Path, *, comfyui_base_dir: str | None = None, token: s
 def stack(tmp_path) -> Any:
     """Spawn fake ComfyUI + proxy on free ports; yield a Stack driver."""
     s, cleanup = _make_stack(tmp_path)
+    try:
+        yield s
+    finally:
+        cleanup()
+
+
+@pytest.fixture
+def stack_with_token(tmp_path) -> Any:
+    """Same as `stack`, but the proxy requires `Authorization: Bearer secret`
+    on every `/api/v2/*` request (the opt-in static-token gate)."""
+    s, cleanup = _make_stack(tmp_path, token="secret")
+    try:
+        yield s
+    finally:
+        cleanup()
+
+
+@pytest.fixture
+def stack_small_upload(tmp_path) -> Any:
+    """Same as `stack`, but the proxy is started with a 1 MB single-request
+    upload ceiling so the streaming size-cap enforcement can be exercised."""
+    s, cleanup = _make_stack(tmp_path, max_upload_mb=1)
     try:
         yield s
     finally:
