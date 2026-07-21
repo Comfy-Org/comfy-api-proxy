@@ -61,6 +61,7 @@ def test_start_status_stop_cycle(tmp_path):
         assert "already running" in again.stderr
     finally:
         stopped = _cli(["stop"], env)
+        assert stopped.returncode == 0, stopped.stderr
         assert "stopped" in stopped.stdout or "not running" in stopped.stdout
 
     # Port released and status reflects stopped.
@@ -77,3 +78,18 @@ def test_stop_when_not_running_is_a_clean_no_op(tmp_path):
     result = _cli(["stop"], env)
     assert result.returncode == 0
     assert "not running" in result.stdout
+
+
+def test_corrupt_state_file_is_ignored_not_a_crash(tmp_path):
+    # A malformed state file (bad JSON, wrong shape, non-int pid) must degrade
+    # to "not running" rather than tracebacking in status/stop.
+    env = {**os.environ, "COMFY_API_PROXY_STATE_DIR": str(tmp_path)}
+    state = tmp_path / "proxy.json"
+    for bad in ("not json at all", "[]", '{"pid": "abc"}', '{"nope": 1}'):
+        state.write_text(bad, encoding="utf-8")
+        st = _cli(["status"], env)
+        assert st.returncode == 1, (bad, st.stderr)
+        assert "not running" in st.stdout
+        state.write_text(bad, encoding="utf-8")
+        stop = _cli(["stop"], env)
+        assert stop.returncode == 0, (bad, stop.stderr)
