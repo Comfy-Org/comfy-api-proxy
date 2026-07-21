@@ -1,7 +1,8 @@
 [project]
 name = "comfy-api-proxy"
-version = "0.0.1"
+version = "0.1.0"
 description = "Local proxy exposing the Comfy API v2 in front of a self-hosted ComfyUI instance."
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "aiohttp>=3.9",
@@ -23,6 +24,11 @@ dev = [
 
 [project.scripts]
 comfy-api-proxy = "comfy_api_proxy.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Comfy-Org/comfy-api-proxy"
+Repository = "https://github.com/Comfy-Org/comfy-api-proxy"
+Issues = "https://github.com/Comfy-Org/comfy-api-proxy/issues"
 
 [build-system]
 requires = ["hatchling"]

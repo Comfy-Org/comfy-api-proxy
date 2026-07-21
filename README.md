@@ -14,12 +14,10 @@ pointed.
 ## Requirements & install
 
 - Python **3.10+** (CI runs 3.10, 3.11, and 3.12 on every pull request).
-- Not yet published to PyPI — install from a checkout:
+- Install from PyPI:
 
   ```bash
-  git clone https://github.com/Comfy-Org/comfy-api-proxy
-  cd comfy-api-proxy
-  pip install -e .
+  pip install comfy-api-proxy
   ```
 
 ## Quickstart
@@ -30,12 +28,17 @@ Point the proxy at an already-running ComfyUI and it serves `/api/v2/*` on
 its own port:
 
 ```bash
-pip install -e .
-comfy-api-proxy --comfyui http://127.0.0.1:8188 --port 8189
+# Start in the background (defaults: ComfyUI at 127.0.0.1:8188, serve on :8189):
+comfy-api-proxy start
+comfy-api-proxy status
+comfy-api-proxy stop
 
-# co-located with ComfyUI, to also enable model-directory uploads:
-comfy-api-proxy --comfyui http://127.0.0.1:8188 --port 8189 \
+# Point it elsewhere / co-locate with ComfyUI to enable model-directory uploads:
+comfy-api-proxy start --comfyui http://127.0.0.1:8188 --port 8189 \
   --comfyui-base-dir /path/to/ComfyUI
+
+# Or run in the foreground (Ctrl+C to stop):
+comfy-api-proxy run
 ```
 
 ### No-GPU demo

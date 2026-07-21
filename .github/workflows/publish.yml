@@ -1,0 +1,157 @@
+# Publishes `comfy-api-proxy` to PyPI.
+#
+# Tag-driven versioning: the release tag (vX.Y.Z) is the single source of truth
+# for the published version. It is injected into pyproject.toml at build time,
+# so the committed version there is just a placeholder — to release a version,
+# create a GitHub Release with the tag you want; no version-bump commit needed.
+#
+# Trigger: a GitHub Release being published (tag vX.Y.Z). That's the only
+# path that reaches the `publish` job below. `workflow_dispatch` is a dry
+# run only — it exercises `build` (compile + `twine check`) but never
+# reaches `publish`, so it's safe to run against any branch to sanity-check
+# the pipeline before cutting a real release.
+#
+# Auth: PyPI Trusted Publishing (OIDC) — no PYPI_TOKEN / API token secret is
+# stored in this repo. A trusted publisher configured on pypi.org for this
+# repo + this workflow + the `pypi` environment is the one-time setup this
+# depends on.
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to build for a dry run (build + twine check only — this input never reaches the publish job)'
+        required: false
+        type: string
+        default: ''
+      publish_to_testpypi:
+        description: 'Also upload the built dist to TestPyPI (requires the optional "testpypi" environment + Trusted Publisher)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.workflow }}-${{ github.event.release.tag_name || github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  # Runs for every trigger. Builds the exact sdist/wheel that `publish` will
+  # upload and validates it with twine. This IS the workflow_dispatch dry
+  # run: trigger this workflow manually via the Actions tab and you get this
+  # job (and nothing else, since `publish` requires a `release` event).
+  build:
+    name: Build and check distribution
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+
+      - name: Install build tooling
+        run: pip install build twine
+
+      # Tag-driven versioning: the release tag (vX.Y.Z) is the source of truth.
+      # Inject it into pyproject.toml before building so the published artifact
+      # carries the tag's version. (On a workflow_dispatch dry run there is no
+      # release tag; the committed placeholder version is built as-is.)
+      - name: Set version from release tag
+        if: github.event_name == 'release'
+        shell: bash
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          # Full SemVer 2.0: X.Y.Z, with an optional -prerelease and an
+          # optional +build-metadata segment (both may be present together).
+          if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+            echo "::error::Release tag '${TAG}' is not a valid version (expected vX.Y.Z)."
+            exit 1
+          fi
+          python3 - "$VERSION" <<'PY'
+          import re, sys
+          version = sys.argv[1]
+          p = "pyproject.toml"
+          s = open(p, encoding="utf-8").read()
+          s2, n = re.subn(r'(?m)^version = "[^"]+"$', f'version = "{version}"', s, count=1)
+          if n != 1:
+              raise SystemExit('could not find a top-level version = "..." line in pyproject.toml')
+          open(p, "w", encoding="utf-8").write(s2)
+          print(f"Set pyproject.toml version = {version}")
+          PY
+
+      - name: Build wheel and sdist
+        run: python -m build
+
+      - name: Verify distribution metadata (twine check)
+        run: twine check dist/*
+
+      - name: Upload built distribution
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pypi-dist
+          path: dist/
+          retention-days: 7
+
+  publish:
+    name: Publish to PyPI
+    needs: [build]
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    # Manual approval gate: the `pypi` environment (Settings -> Environments)
+    # has required reviewers, so every publish needs a human click even though
+    # the trigger (release published) is automatic.
+    environment: pypi
+    permissions:
+      id-token: write # OIDC for PyPI Trusted Publishing — no API token secret
+      contents: read
+    steps:
+      - name: Download built distribution
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pypi-dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@76f52bc884231f62b9a034ebfe128415bbaabdfc # v1.12.4
+        with:
+          packages-dir: dist/
+          skip-existing: true # idempotent re-runs: no-op instead of erroring if this version is already up
+
+  # Nice-to-have: exercise the full OIDC publish path against TestPyPI
+  # without touching real PyPI. Opt-in via workflow_dispatch input; needs
+  # its own Trusted Publisher + "testpypi" environment.
+  publish-testpypi:
+    name: Publish to TestPyPI (dry run)
+    needs: [build]
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.publish_to_testpypi == 'true'
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Download built distribution
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pypi-dist
+          path: dist/
+
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@76f52bc884231f62b9a034ebfe128415bbaabdfc # v1.12.4
+        with:
+          packages-dir: dist/
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
