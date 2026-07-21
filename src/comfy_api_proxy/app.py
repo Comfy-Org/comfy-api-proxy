@@ -456,6 +456,31 @@ class Proxy:
                 "This is a UI-export graph. Export the workflow in API format instead.",
             )
 
+        # Optional, typed, CLOSED extra_data (mirrors the v2 contract's
+        # `additionalProperties: false`): the only accepted key is
+        # `api_key_comfy_org` — the Comfy API key partner/API nodes authenticate
+        # with. It rides the upstream /prompt body verbatim and is never
+        # persisted or logged. Reject any other shape so the proxy stays
+        # faithful to the contract instead of forwarding arbitrary data.
+        extra_data = body.get("extra_data")
+        if extra_data is not None:
+            if not isinstance(extra_data, dict) or set(extra_data) - {"api_key_comfy_org"}:
+                return _error(
+                    400,
+                    "invalid_request",
+                    "'extra_data' accepts only the 'api_key_comfy_org' field.",
+                )
+            # The schema types api_key_comfy_org as a (non-nullable) string, so a
+            # present-but-null or non-string value is rejected — not forwarded.
+            if "api_key_comfy_org" in extra_data and not isinstance(
+                extra_data["api_key_comfy_org"], str
+            ):
+                return _error(
+                    400,
+                    "invalid_request",
+                    "'extra_data.api_key_comfy_org' must be a string.",
+                )
+
         missing: list[str] = []
         resolved_workflow = self._rewrite_asset_refs(workflow, missing)
         if missing:
@@ -514,6 +539,13 @@ class Proxy:
             "prompt_id": job_id,
             "client_id": job_id,
         }
+        # Forward extra_data (partner-node auth) verbatim to ComfyUI's /prompt.
+        # We never store it on the job row (see self._jobs below), and the
+        # client-facing job response is built field-by-field from an allow-list
+        # (_job), so the credential can't surface through this proxy regardless
+        # of what ComfyUI's /history returns.
+        if extra_data:
+            payload["extra_data"] = extra_data
         try:
             async with self.session.post(self.comfyui + "/prompt", json=payload) as r:
                 if r.status != 200:

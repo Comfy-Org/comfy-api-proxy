@@ -106,6 +106,13 @@ async def prompt(request: web.Request) -> web.Response:
         "outputs": _default_outputs(),
         "hang": hang,
         "client_id": client_id,
+        # Record what the proxy forwarded so a test can prove extra_data
+        # (partner-node auth) rode the /prompt body verbatim. `present` captures
+        # genuine wire-level key membership — distinguishing "omitted" from a
+        # (never-sent) explicit null — so the "never an empty key" contract is
+        # actually testable, not just a None read.
+        "extra_data": body.get("extra_data"),
+        "extra_data_present": "extra_data" in body,
     }
     if not hang:
         asyncio.create_task(_auto_complete(prompt_id, complete_after))
@@ -134,6 +141,15 @@ async def history(request: web.Request) -> web.Response:
     if job and job["state"] in ("success", "interrupted"):
         return web.json_response({pid: _history_entry(job)})
     return web.json_response({})
+
+
+async def debug_extra_data(request: web.Request) -> web.Response:
+    # Test-only introspection: what extra_data (if any) the proxy forwarded on
+    # the /prompt call for this prompt_id. Not part of ComfyUI's real surface.
+    job = _jobs.get(request.match_info["id"]) or {}
+    return web.json_response(
+        {"extra_data": job.get("extra_data"), "present": job.get("extra_data_present", False)}
+    )
 
 
 async def queue(request: web.Request) -> web.Response:
@@ -249,6 +265,7 @@ def make_fake() -> web.Application:
         [
             web.post("/prompt", prompt),
             web.get("/history/{id}", history),
+            web.get("/_debug/extra_data/{id}", debug_extra_data),
             web.get("/queue", queue),
             web.get("/view", view),
             web.post("/upload/image", upload_image),

@@ -363,6 +363,19 @@ paths:
                   type: object
                   description: API-format workflow graph, verbatim.
                   additionalProperties: true
+                extra_data:
+                  type: object
+                  description: >-
+                    Per-prompt ComfyUI `extra_data`, same shape as Comfy Cloud
+                    and local ComfyUI. Closed object: only the enumerated keys
+                    are accepted, keeping the contract fully typed. Forwarded
+                    to the worker per-prompt, never persisted, and excluded
+                    from idempotency comparison.
+                  additionalProperties: false
+                  properties:
+                    api_key_comfy_org:
+                      type: string
+                      description: API key for partner (API) nodes.
       responses:
         '201':
           description: Job created and queued.

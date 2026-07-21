@@ -191,6 +191,88 @@ def test_reserved_fields_rejected(stack):
     assert body["error"]["code"] == "invalid_workflow"
 
 
+def _fake_prompt_extra_data(stack, job_id):
+    # Read back what the proxy forwarded on the upstream /prompt call, straight
+    # from the fake ComfyUI (job_id == the proxy-minted prompt_id). Returns
+    # (present, value): `present` is genuine wire-level key membership, so a
+    # test can tell "omitted" from an explicit null.
+    url = f"http://127.0.0.1:{stack.comfyui_port}/_debug/extra_data/{job_id}"
+    status, body, raw = stack.request("GET", url)
+    assert status == 200, raw
+    return body["present"], body["extra_data"]
+
+
+def test_extra_data_api_key_forwarded_to_prompt(stack):
+    # extra_data.api_key_comfy_org (partner-node auth) must ride the upstream
+    # /prompt body verbatim.
+    status, job, raw = stack.request(
+        "POST",
+        "/api/v2/jobs",
+        {"workflow": {"1": {}}, "extra_data": {"api_key_comfy_org": "comfyui-secret"}},
+    )
+    assert status == 201, raw
+    present, value = _fake_prompt_extra_data(stack, job["id"])
+    assert present and value == {"api_key_comfy_org": "comfyui-secret"}
+
+
+def test_extra_data_absent_when_not_supplied(stack):
+    # No extra_data in the request => the proxy must not send an extra_data key
+    # upstream AT ALL (genuine absence, not an explicit null).
+    status, job, raw = stack.request("POST", "/api/v2/jobs", {"workflow": {"1": {}}})
+    assert status == 201, raw
+    present, _ = _fake_prompt_extra_data(stack, job["id"])
+    assert present is False
+
+
+def test_extra_data_empty_object_accepted_but_not_forwarded(stack):
+    # An empty extra_data is schema-valid (a closed object with no keys) — accept
+    # it, but forward nothing (never send an empty object upstream).
+    status, job, raw = stack.request(
+        "POST", "/api/v2/jobs", {"workflow": {"1": {}}, "extra_data": {}}
+    )
+    assert status == 201, raw
+    present, _ = _fake_prompt_extra_data(stack, job["id"])
+    assert present is False
+
+
+def test_extra_data_rejects_uncontracted_shapes(stack):
+    # Closed, typed object: only a string api_key_comfy_org is accepted.
+    for bad in (
+        {"api_key_comfy_org": "k", "surprise": 1},  # unknown key
+        {"auth_token_comfy_org": "t"},  # not in the v2 contract
+        {"api_key_comfy_org": 123},  # wrong type
+        {"api_key_comfy_org": None},  # present-but-null (schema says string)
+        "not-an-object",
+    ):
+        status, body, raw = stack.request(
+            "POST", "/api/v2/jobs", {"workflow": {"1": {}}, "extra_data": bad}
+        )
+        assert status == 400, f"{bad!r} -> {raw!r}"
+        assert body["error"]["code"] == "invalid_request", raw
+
+
+def test_idempotency_key_reuse_ignores_differing_api_key(stack):
+    # api_key_comfy_org is excluded from the idempotency comparison: a resubmit
+    # under the same key is rejected as reuse even with a different api_key —
+    # the key is single-use (reject-on-duplicate), body is never compared.
+    hdr = {"Idempotency-Key": "reuse-extradata-1"}
+    status, _, raw = stack.request(
+        "POST",
+        "/api/v2/jobs",
+        {"workflow": {"1": {}}, "extra_data": {"api_key_comfy_org": "comfyui-a"}},
+        headers=hdr,
+    )
+    assert status == 201, raw
+    status, body, raw = stack.request(
+        "POST",
+        "/api/v2/jobs",
+        {"workflow": {"1": {}}, "extra_data": {"api_key_comfy_org": "comfyui-b"}},
+        headers=hdr,
+    )
+    assert status == 422, raw
+    assert body["error"]["code"] == "idempotency_key_reuse", raw
+
+
 def test_cancel_running_job(stack):
     # A "hang" input keeps the fake job in-flight so cancel has a real target.
     workflow = {"1": {"class_type": "Noop", "inputs": {"hang": True}}}

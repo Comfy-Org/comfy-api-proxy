@@ -91,6 +91,25 @@ it — a client that never opens it still sees the same state by polling. See
 [Live events (SSE)](#live-events-sse) below for what the stream carries and
 its concurrent-connection limit.
 
+### Partner (API) node auth — `extra_data`
+
+Workflows that use partner/API nodes (Gemini, etc.) need a Comfy API key to
+authenticate them. Pass it alongside the workflow on submit:
+
+```jsonc
+POST /api/v2/jobs
+{
+  "workflow": { /* API-format graph */ },
+  "extra_data": { "api_key_comfy_org": "comfyui-…" }
+}
+```
+
+`extra_data` is a closed, typed object — the only accepted field is
+`api_key_comfy_org` (any other shape is rejected `400 invalid_request`). One key
+authenticates every partner node in the workflow. The proxy forwards it verbatim
+onto ComfyUI's `/prompt` call and **never stores or logs it** (ComfyUI likewise
+strips it from history). Omit `extra_data` entirely when you have no key.
+
 ### Model-file uploads (`checkpoints/`, `loras/`, `vae/`, ...)
 
 ComfyUI's own `/upload/image` only understands `input`/`output`/`temp` — it
