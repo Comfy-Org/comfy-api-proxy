@@ -25,20 +25,18 @@ pointed.
 ### Against a real ComfyUI
 
 Point the proxy at an already-running ComfyUI and it serves `/api/v2/*` on
-its own port:
+its own port. It runs in the foreground until you stop it with Ctrl+C:
 
 ```bash
-# Start in the background (defaults: ComfyUI at 127.0.0.1:8188, serve on :8189):
-comfy-api-proxy start
-comfy-api-proxy status
-comfy-api-proxy stop
+# Defaults: proxy the ComfyUI at 127.0.0.1:8188, serve the v2 API on :8189.
+comfy-api-proxy
 
 # Point it elsewhere / co-locate with ComfyUI to enable model-directory uploads:
-comfy-api-proxy start --comfyui http://127.0.0.1:8188 --port 8189 \
+comfy-api-proxy --comfyui http://127.0.0.1:8188 --port 8189 \
   --comfyui-base-dir /path/to/ComfyUI
 
-# Or run in the foreground (Ctrl+C to stop):
-comfy-api-proxy run
+# Background it with your shell (& ) if you want your prompt back:
+comfy-api-proxy &
 ```
 
 ### No-GPU demo
@@ -200,7 +198,7 @@ comfy-api-proxy --comfyui http://127.0.0.1:8188 --port 8189 [options]
 
 Any real integration — and `demo/run_demo.py` — uses the same client SDKs
 Comfy Cloud users use, just pointed at this proxy's `--host:--port` instead
-of `api.comfy.org` / `cloud.comfy.org`:
+of `api.comfy.org`:
 
 - [ComfyPythonSDK](https://github.com/Comfy-Org/ComfyPythonSDK)
 - [ComfyTypeScriptSDK](https://github.com/Comfy-Org/ComfyTypeScriptSDK)
