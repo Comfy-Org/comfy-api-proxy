@@ -3,13 +3,38 @@ name = "comfy-api-proxy"
 version = "0.1.0"
 description = "Local proxy exposing the Comfy API v2 in front of a self-hosted ComfyUI instance."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
+authors = [{ name = "Comfy Org" }]
+keywords = ["comfyui", "comfy", "proxy", "api", "generative-ai", "workflow"]
+# No "License :: OSI Approved" classifier here on purpose: PyPI rejects
+# uploads that set a license classifier alongside a PEP 639 License-Expression.
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Framework :: AsyncIO",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: Internet :: Proxy Servers",
+    "Typing :: Typed",
+]
 dependencies = [
     "aiohttp>=3.9",
     "blake3>=0.4",
     "pydantic>=2.6",
     "PyYAML>=6.0",
 ]
+
+[project.urls]
+Homepage = "https://docs.comfy.org"
+Documentation = "https://docs.comfy.org"
+Repository = "https://github.com/Comfy-Org/comfy-api-proxy"
+Issues = "https://github.com/Comfy-Org/comfy-api-proxy/issues"
 
 [project.optional-dependencies]
 dev = [
@@ -25,17 +50,30 @@ dev = [
 [project.scripts]
 comfy-api-proxy = "comfy_api_proxy.cli:main"
 
-[project.urls]
-Homepage = "https://github.com/Comfy-Org/comfy-api-proxy"
-Repository = "https://github.com/Comfy-Org/comfy-api-proxy"
-Issues = "https://github.com/Comfy-Org/comfy-api-proxy/issues"
-
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/comfy_api_proxy"]
+# PEP 561: ship the marker so consumers' type checkers use our annotations.
+artifacts = ["src/comfy_api_proxy/py.typed"]
+
+# Without an explicit list hatchling sweeps in everything git doesn't ignore,
+# which put local dev droppings (a stale .coverage database) and repo-only
+# config (.github/, .coderabbit.yaml, uv.lock) into the published sdist. Keep
+# it to what's needed to build and run the tests from a tarball.
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/",
+    "tests/",
+    "scripts/",
+    "spec/",
+    "demo/",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

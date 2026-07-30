@@ -15,6 +15,7 @@
   <a href="https://pypi.org/project/comfy-api-proxy/"><img src="https://img.shields.io/pypi/v/comfy-api-proxy?style=for-the-badge&logo=pypi&logoColor=white&label=PyPI" alt="PyPI"></a>
   <a href="#requirements--install"><img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.10+"></a>
   <a href="https://github.com/Comfy-Org/comfy-api-proxy/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Comfy-Org/comfy-api-proxy/ci.yml?style=for-the-badge&logo=githubactions&logoColor=white&label=CI" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-lightgrey?style=for-the-badge" alt="License: MIT"></a>
   <a href="https://cloud.comfy.org"><img src="https://img.shields.io/badge/Comfy_Cloud-cloud.comfy.org-211927?style=for-the-badge" alt="Comfy Cloud"></a>
 </p>
 
