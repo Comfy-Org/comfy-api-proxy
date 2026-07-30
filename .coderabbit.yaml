@@ -2,13 +2,8 @@
 language: "en-US"
 early_access: false
 tone_instructions: |
-  This is a Python/aiohttp service (comfy-api-proxy). CI already runs
-  `ruff check`, `ruff format --check`, and `mypy` on every PR — do not repeat
-  their findings or nitpick style/formatting. Focus on correctness, security
-  (no hardcoded credentials or upstream URLs), async/await handling, and
-  error propagation between the proxy and its upstream. Only comment on
-  issues introduced by this PR's changes; do not flag pre-existing problems
-  in moved, re-indented, or reformatted code.
+  Direct and technical. Lead with the concrete risk or breakage, not praise.
+  No compliments or filler — if a change is fine, say nothing.
 
 reviews:
   profile: "assertive"
@@ -34,6 +29,16 @@ reviews:
     - "!.venv/**"
 
   path_instructions:
+    # Repo-wide review rules. These used to live in `tone_instructions`, but
+    # that field is capped at 250 characters by the CodeRabbit schema, which
+    # silently invalidated this whole file.
+    - path: "**"
+      instructions: |
+        CI already runs `ruff check`, `ruff format --check`, and `mypy` on
+        every PR — do not repeat their findings or nitpick style/formatting.
+
+        Only comment on issues introduced by this PR's changes; do not flag
+        pre-existing problems in moved, re-indented, or reformatted code.
     - path: "src/comfy_api_proxy/**"
       instructions: |
         Core proxy service code. Focus on:
