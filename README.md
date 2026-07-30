@@ -1,6 +1,24 @@
-# comfy-api-proxy
+<div align="center">
 
-[![CI](https://github.com/Comfy-Org/comfy-api-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/Comfy-Org/comfy-api-proxy/actions/workflows/ci.yml)
+<img src="assets/logo.svg" alt="Comfy" width="130"/>
+
+<h1>comfy-api-proxy</h1>
+
+<p>
+  <strong>The <a href="https://docs.comfy.org">Comfy API v2</a>, in front of your own ComfyUI.</strong><br/>
+  Point SDK code written for Comfy Cloud at a self-hosted ComfyUI — same contract, no forked integration.
+</p>
+
+</div>
+
+<p align="center">
+  <a href="https://pypi.org/project/comfy-api-proxy/"><img src="https://img.shields.io/pypi/v/comfy-api-proxy?style=for-the-badge&logo=pypi&logoColor=white&label=PyPI" alt="PyPI"></a>
+  <a href="#requirements--install"><img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.10+"></a>
+  <a href="https://github.com/Comfy-Org/comfy-api-proxy/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Comfy-Org/comfy-api-proxy/ci.yml?style=for-the-badge&logo=githubactions&logoColor=white&label=CI" alt="CI"></a>
+  <a href="https://cloud.comfy.org"><img src="https://img.shields.io/badge/Comfy_Cloud-cloud.comfy.org-211927?style=for-the-badge" alt="Comfy Cloud"></a>
+</p>
+
+---
 
 A local service that puts the **Comfy API v2** in front of a self-hosted ComfyUI
 instance. The same client SDK code that talks to Comfy Cloud can drive a
@@ -200,8 +218,11 @@ Any real integration — and `demo/run_demo.py` — uses the same client SDKs
 Comfy Cloud users use, just pointed at this proxy's `--host:--port` instead
 of `api.comfy.org`:
 
-- [comfy-python-sdk](https://github.com/Comfy-Org/comfy-python-sdk) (`comfy-sdk`)
-- [comfy-typescript-sdk](https://github.com/Comfy-Org/comfy-typescript-sdk) (`@comfyorg/sdk`)
+| Project | Language | Package |
+|---|---|---|
+| [comfy-python-sdk](https://github.com/Comfy-Org/comfy-python-sdk) | Python | `comfy-sdk` |
+| [comfy-typescript-sdk](https://github.com/Comfy-Org/comfy-typescript-sdk) | TypeScript | `@comfyorg/sdk` |
+| [comfy-swift-sdk](https://github.com/Comfy-Org/comfy-swift-sdk) | Swift | SwiftPM |
 
 `spec/openapi.yaml` in this repo is a synced, filtered copy of that same
 Comfy API v2 contract — see `spec/README.md` for what "filtered" means, and
