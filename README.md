@@ -60,7 +60,7 @@ one before running the demo:
 ```
 some-parent-dir/
 ├── comfy-api-proxy/   (this repo)
-└── ComfyPythonSDK/
+└── comfy-python-sdk/
 ```
 
 CI never depends on that checkout being present: the test suite
@@ -200,8 +200,8 @@ Any real integration — and `demo/run_demo.py` — uses the same client SDKs
 Comfy Cloud users use, just pointed at this proxy's `--host:--port` instead
 of `api.comfy.org`:
 
-- [ComfyPythonSDK](https://github.com/Comfy-Org/ComfyPythonSDK)
-- [ComfyTypeScriptSDK](https://github.com/Comfy-Org/ComfyTypeScriptSDK)
+- [comfy-python-sdk](https://github.com/Comfy-Org/comfy-python-sdk) (`comfy-sdk`)
+- [comfy-typescript-sdk](https://github.com/Comfy-Org/comfy-typescript-sdk) (`@comfyorg/sdk`)
 
 `spec/openapi.yaml` in this repo is a synced, filtered copy of that same
 Comfy API v2 contract — see `spec/README.md` for what "filtered" means, and

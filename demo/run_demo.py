@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 # Make the demo self-contained: import the SDK from the sibling repo checkout.
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "ComfyPythonSDK"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "comfy-python-sdk"))
 from comfy_sdk import Comfy  # noqa: E402
 
 # A minimal API-format workflow. The fake ComfyUI ignores the content and

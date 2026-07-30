@@ -8,7 +8,7 @@ status, download the output - using nothing but the Python standard library
 confirms it *runs*.
 
 This deliberately does NOT use ``demo/run_demo.py`` or the ``comfy_sdk``
-package: that SDK lives in a separate, private repo (Comfy-Org/ComfyPythonSDK),
+package: that SDK lives in a separate repo (Comfy-Org/comfy-python-sdk),
 and this repo's CI must not depend on another repo's credentials to pass.
 ``demo/run_demo.py`` remains the human-facing demo for people who have that SDK
 installed; this test is the self-contained check CI actually runs.
