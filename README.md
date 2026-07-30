@@ -223,7 +223,6 @@ of `api.comfy.org`:
 |---|---|---|
 | [comfy-python-sdk](https://github.com/Comfy-Org/comfy-python-sdk) | Python | `comfy-sdk` |
 | [comfy-typescript-sdk](https://github.com/Comfy-Org/comfy-typescript-sdk) | TypeScript | `@comfyorg/sdk` |
-| [comfy-swift-sdk](https://github.com/Comfy-Org/comfy-swift-sdk) | Swift | SwiftPM |
 
 `spec/openapi.yaml` in this repo is a synced, filtered copy of that same
 Comfy API v2 contract — see `spec/README.md` for what "filtered" means, and
