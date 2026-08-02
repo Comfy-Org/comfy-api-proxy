@@ -55,8 +55,8 @@ CI jobs: `lint`, `typecheck`, `spec-drift`, `test` (Python 3.10 / 3.11 / 3.12 ma
 - **Tests use the standard library only** — no SDK, no third-party HTTP client, nothing beyond localhost — so CI never depends on another repo or a credential. Keep it that way.
 - **Don't bump `version` in `pyproject.toml`.** Publishing is tag-driven: `.github/workflows/publish.yml` injects the release tag (`vX.Y.Z`) at build time, so the committed value is a placeholder.
 - **Workflows are zizmor-audited.** Pin every action to a full commit SHA with a trailing `# vX.Y.Z` comment, and keep `persist-credentials: false` on checkouts.
-- **Commits and PRs:** conventional-commit subjects (`feat:`, `fix:`, `docs:`, `ci:`, `test:`, `chore:`), squash-merged with the PR number in the subject. `.github/CODEOWNERS` owns every path, so each PR needs an approving review from the code-owner teams.
-- **Style:** Python 3.10+ (`from __future__ import annotations` at the top of every module), ruff with `line-length = 100` and the `E,F,I,UP,W` rule set, mypy deliberately lenient — not `--strict`, so full annotation coverage is not required.
+- **Commits and PRs:** conventional-commit subjects (`feat:`, `fix:`, `docs:`, `ci:`, `test:`, `chore:`), normally squash-merged with the PR number in the subject. `.github/CODEOWNERS` owns every path, so each PR needs an approving review from the code-owner teams.
+- **Style:** Python 3.10+ (`from __future__ import annotations` at the top of every module but the package `__init__.py`), ruff with `line-length = 100` and the `E,F,I,UP,W` rule set, mypy deliberately lenient — not `--strict`, so full annotation coverage is not required.
 - **CodeRabbit reviews this repo** using the per-path instructions in `.coderabbit.yaml` (`demo/` is held to a lower bar than `src/`; ruff findings are suppressed there because CI already runs them).
 
 ## Deeper docs
