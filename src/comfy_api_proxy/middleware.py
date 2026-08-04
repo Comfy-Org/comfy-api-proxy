@@ -102,8 +102,10 @@ def normalize_cors_origin(value: str) -> str:
     """Validate and normalize a single ``--enable-cors-header`` value.
 
     Accepts ``http(s)://host[:port]`` only. Trailing slashes are stripped.
-    ``*`` is refused — authenticated browser traffic must never get an
-    unrestricted wildcard ACAO.
+    Userinfo and malformed/empty ports are rejected. Default ports (80 for
+    http, 443 for https) are omitted so allowlist matching matches browser
+    ``Origin`` headers. ``*`` is refused — authenticated browser traffic
+    must never get an unrestricted wildcard ACAO.
     """
     raw = value.strip()
     if not raw:
@@ -116,14 +118,31 @@ def normalize_cors_origin(value: str) -> str:
         )
     parsed = urllib.parse.urlparse(raw)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise ValueError(
-            f"CORS origin must be an absolute http(s) URL with a host, got {value!r}."
-        )
+        raise ValueError(f"CORS origin must be an absolute http(s) URL with a host, got {value!r}.")
+    if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+        raise ValueError(f"CORS origin must not include userinfo, got {value!r}.")
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError(f"CORS origin must be an absolute http(s) URL with a host, got {value!r}.")
+    # Empty port (``http://host:``) leaves ``port`` as None but keeps the colon.
+    authority = parsed.netloc.rsplit("@", 1)[-1]
+    if authority.endswith(":"):
+        raise ValueError(f"CORS origin has an empty port, got {value!r}.")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"CORS origin has an invalid port, got {value!r}.") from exc
     if parsed.path not in ("", "/") or parsed.params or parsed.query or parsed.fragment:
-        raise ValueError(
-            f"CORS origin must not include a path, query, or fragment, got {value!r}."
-        )
-    return f"{parsed.scheme}://{parsed.netloc}"
+        raise ValueError(f"CORS origin must not include a path, query, or fragment, got {value!r}.")
+    # Reconstruct from validated host/port (not raw netloc) for a stable allowlist key.
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    if (
+        port is None
+        or (parsed.scheme == "http" and port == 80)
+        or (parsed.scheme == "https" and port == 443)
+    ):
+        return f"{parsed.scheme}://{host}"
+    return f"{parsed.scheme}://{host}:{port}"
 
 
 def apply_cors_headers(response: web.StreamResponse, origin: str) -> None:

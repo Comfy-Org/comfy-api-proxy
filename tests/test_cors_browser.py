@@ -1,13 +1,10 @@
 """Browser-origin → localhost proxy: allowlisted CORS end-to-end.
 
 Simulates a hosted web app (Origin: https://app.example.com) calling a
-proxy bound on 127.0.0.1 — the ordinaryanimator-style deployment shape
-from GitHub issue #19 / Linear BE-6449.
+proxy bound on 127.0.0.1 — the ordinary hosted-web-app → local-proxy shape.
 """
 
 from __future__ import annotations
-
-from comfy_api_proxy.middleware import CORS_ALLOW_HEADERS, CORS_EXPOSE_HEADERS
 
 HOSTED_ORIGIN = "https://app.example.com"
 EVIL_ORIGIN = "https://evil.example"
@@ -15,10 +12,18 @@ EVIL_ORIGIN = "https://evil.example"
 
 def _assert_cors_headers(headers: dict[str, str], *, origin: str = HOSTED_ORIGIN) -> None:
     assert headers.get("access-control-allow-origin") == origin
-    assert "authorization" in headers.get("access-control-allow-headers", "").lower()
-    assert "idempotency-key" in headers.get("access-control-allow-headers", "").lower()
-    assert headers.get("access-control-allow-headers") == CORS_ALLOW_HEADERS
-    assert headers.get("access-control-expose-headers") == CORS_EXPOSE_HEADERS
+    allow = {
+        p.strip().lower()
+        for p in headers.get("access-control-allow-headers", "").split(",")
+        if p.strip()
+    }
+    assert {"authorization", "content-type", "idempotency-key"} <= allow
+    expose = {
+        p.strip().lower()
+        for p in headers.get("access-control-expose-headers", "").split(",")
+        if p.strip()
+    }
+    assert {"retry-after", "content-range", "accept-ranges"} <= expose
     assert headers.get("access-control-allow-credentials") == "true"
     assert "origin" in {p.strip().lower() for p in headers.get("vary", "").split(",")}
 
@@ -87,6 +92,21 @@ def test_non_allowlisted_origin_is_rejected(stack_with_cors):
         "/api/v2/health",
         headers={
             "Origin": EVIL_ORIGIN,
+            "Sec-Fetch-Site": "cross-site",
+        },
+    )
+    assert status == 403
+    assert body is not None and body["error"]["code"] == "forbidden_origin"
+    assert "access-control-allow-origin" not in headers
+
+
+def test_non_allowlisted_preflight_is_rejected(stack_with_cors):
+    status, body, _raw, headers = stack_with_cors.request_with_headers(
+        "OPTIONS",
+        "/api/v2/health",
+        headers={
+            "Origin": EVIL_ORIGIN,
+            "Access-Control-Request-Method": "GET",
             "Sec-Fetch-Site": "cross-site",
         },
     )

@@ -50,3 +50,18 @@ def test_main_refuses_cors_origin_with_path(capsys):
     )
     assert rc == 2
     assert "invalid --enable-cors-header" in capsys.readouterr().err
+
+
+def test_main_refuses_cors_origin_with_invalid_port(capsys):
+    rc = main(
+        [
+            "--port",
+            "0",
+            "--comfyui",
+            "http://127.0.0.1:8188",
+            "--enable-cors-header",
+            "https://app.example.com:bad",
+        ]
+    )
+    assert rc == 2
+    assert "invalid --enable-cors-header" in capsys.readouterr().err

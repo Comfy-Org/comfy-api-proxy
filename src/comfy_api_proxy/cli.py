@@ -1,4 +1,14 @@
-"""Command-line entry point: ``comfy-api-proxy --comfyui URL --port N``.
+"""Command-line entry point.
+
+Usage:
+
+  * ``comfy-api-proxy`` / ``comfy-api-proxy run`` — run in the foreground
+    (Ctrl+C to stop). A bare invocation with flags is treated as ``run`` for
+    backward compatibility.
+  * ``comfy-api-proxy start`` — start in the background (detached); prints the
+    URL and returns.
+  * ``comfy-api-proxy stop`` — stop the background proxy.
+  * ``comfy-api-proxy status`` — report whether the background proxy is running.
 
 Security posture (the defaults are the safety net):
 
@@ -22,6 +32,7 @@ import sys
 
 from aiohttp import web
 
+from . import service
 from .app import _DEFAULT_MAX_UPLOAD_BYTES, make_app
 from .auth import make_bearer_auth_middleware
 from .middleware import (
@@ -30,6 +41,8 @@ from .middleware import (
     make_origin_only_middleware,
     normalize_cors_origin,
 )
+
+_COMMANDS = {"run", "start", "stop", "status"}
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -45,8 +58,7 @@ def _is_loopback_host(host: str) -> bool:
         return host == "localhost"
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="comfy-api-proxy")
+def _add_server_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--comfyui",
         default="http://127.0.0.1:8188",
@@ -97,23 +109,37 @@ def main(argv: list[str] | None = None) -> int:
         "explicit origin such as https://app.example.com. Unlike ComfyUI "
         "core, '*' is refused — see docs/browser-access.md.",
     )
-    args = parser.parse_args(argv)
 
+
+def _bind_refused(args: argparse.Namespace) -> bool:
     if not _is_loopback_host(args.host) and not args.token and not args.allow_insecure_bind:
         print(
             f"refusing to bind non-loopback host {args.host!r} without --token "
             "(pass --allow-insecure-bind to override).",
             file=sys.stderr,
         )
-        return 2
+        return True
+    return False
 
+
+def _parse_cors_origins(raw_origins: list[str]) -> list[str] | None:
+    """Normalize allowlisted origins, or print and return None on error."""
     cors_origins: list[str] = []
-    for raw in args.cors_origins:
+    for raw in raw_origins:
         try:
             cors_origins.append(normalize_cors_origin(raw))
         except ValueError as exc:
             print(f"invalid --enable-cors-header: {exc}", file=sys.stderr)
-            return 2
+            return None
+    return cors_origins
+
+
+def _run_foreground(args: argparse.Namespace) -> int:
+    if _bind_refused(args):
+        return 2
+    cors_origins = _parse_cors_origins(args.cors_origins)
+    if cors_origins is None:
+        return 2
 
     # Outermost first: CORS (preflight + headers) → origin guard → optional auth.
     middlewares: list = []
@@ -133,6 +159,62 @@ def main(argv: list[str] | None = None) -> int:
         attach_cors_prepare(app)
     web.run_app(app, host=args.host, port=args.port)
     return 0
+
+
+def _server_argv(args: argparse.Namespace) -> list[str]:
+    """Reconstruct the run flags to hand to a detached child process."""
+    argv = [
+        "--comfyui",
+        args.comfyui,
+        "--host",
+        args.host,
+        "--port",
+        str(args.port),
+        "--max-upload-mb",
+        str(args.max_upload_mb),
+    ]
+    if args.token:
+        argv += ["--token", args.token]
+    if args.comfyui_base_dir:
+        argv += ["--comfyui-base-dir", args.comfyui_base_dir]
+    if args.allow_insecure_bind:
+        argv += ["--allow-insecure-bind"]
+    for origin in args.cors_origins:
+        argv += ["--enable-cors-header", origin]
+    return argv
+
+
+def main(argv: list[str] | None = None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    # Backward compatibility: a bare invocation (no subcommand, or leading flags)
+    # runs in the foreground, same as the original single-command CLI.
+    if not raw or (raw[0] not in _COMMANDS and raw[0] not in ("-h", "--help")):
+        raw = ["run", *raw]
+
+    parser = argparse.ArgumentParser(prog="comfy-api-proxy")
+    sub = parser.add_subparsers(dest="command", required=True)
+    run_p = sub.add_parser("run", help="Run in the foreground (Ctrl+C to stop).")
+    _add_server_args(run_p)
+    start_p = sub.add_parser("start", help="Start the proxy in the background.")
+    _add_server_args(start_p)
+    sub.add_parser("stop", help="Stop the background proxy.")
+    sub.add_parser("status", help="Show whether the background proxy is running.")
+
+    args = parser.parse_args(raw)
+
+    if args.command == "run":
+        return _run_foreground(args)
+    if args.command == "start":
+        if _bind_refused(args):
+            return 2
+        if _parse_cors_origins(args.cors_origins) is None:
+            return 2
+        return service.start(_server_argv(args), args.host, args.port)
+    if args.command == "stop":
+        return service.stop()
+    if args.command == "status":
+        return service.status()
+    return 2  # unreachable (subparser is required)
 
 
 if __name__ == "__main__":
