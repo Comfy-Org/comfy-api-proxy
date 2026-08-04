@@ -112,6 +112,7 @@ async def prompt(request: web.Request) -> web.Response:
         "outputs": {} if cache_hit else _default_outputs(),
         "hang": hang,
         "cache_hit": cache_hit,
+        "node_ids": list(graph.keys()),
         "client_id": client_id,
         # Record what the proxy forwarded so a test can prove extra_data
         # (partner-node auth) rode the /prompt body verbatim. `present` captures
@@ -137,19 +138,27 @@ def _history_entry(job: dict) -> dict:
             },
         }
     if job.get("cache_hit"):
-        # Mimic ComfyUI execution-cache reuse: success + execution_cached,
-        # typically with no new SaveImage outputs.
+        # Real execution-cache reuse: execution_cached names the nodes it
+        # served, and there are typically no new SaveImage outputs.
         return {
             "outputs": {},
             "status": {
                 "status_str": "success",
                 "completed": True,
-                "messages": [["execution_cached", {"nodes": []}]],
+                "messages": [["execution_cached", {"nodes": job.get("node_ids") or ["1"]}]],
             },
         }
     return {
         "outputs": job["outputs"],
-        "status": {"status_str": "success", "completed": True, "messages": []},
+        "status": {
+            "status_str": "success",
+            "completed": True,
+            # Real ComfyUI emits execution_cached on every run, with an empty
+            # node list when nothing was cached. Reproduce that, or consumers
+            # that key off the message's mere presence look correct here and
+            # misreport against a real server.
+            "messages": [["execution_cached", {"nodes": []}]],
+        },
     }
 
 

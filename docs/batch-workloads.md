@@ -54,6 +54,6 @@ Not Cloud OpenAPI parity (`spec/openapi.yaml` is one-way from upstream):
 | `GET /api/v2/health` | Process probe; does not call ComfyUI; unauthenticated |
 | `GET /api/v2/jobs` | Jobs this proxy recorded. Resolves each candidate against ComfyUI, so the walk stops after 500 records; `truncated: true` means it stopped early rather than running out of matches |
 | `metadata` / `priority` | Opaque ≤1 KiB string; advisory int |
-| `outputs_reused` | `true` when history has `execution_cached` |
+| `outputs_reused` | `true` when `execution_cached` names at least one node. ComfyUI emits that message on every run, empty when it cached nothing, so presence alone does not mean reuse |
 | `POST /api/v2/assets/from-path` | Register a host file under `--comfyui-base-dir` |
 | `output_unavailable` | Typed 404 when output bytes are gone |

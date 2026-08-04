@@ -98,6 +98,20 @@ def test_list_jobs_returns_recorded_jobs(stack):
     assert job["id"] in ids
 
 
+def test_outputs_reused_false_when_nothing_was_cached(stack):
+    """ComfyUI emits execution_cached on every run, empty when it cached
+    nothing — a normal execution must not report reuse."""
+    _, asset, _ = stack.upload("cat.png", _PNG, "image/png")
+    status, job, raw = stack.request(
+        "POST", "/api/v2/jobs", {"workflow": _simple_workflow(asset["id"])}
+    )
+    assert status == 201, raw
+    job = _wait_terminal(stack, job)
+    assert job["status"] == "succeeded"
+    assert job["outputs_reused"] is False
+    assert job["outputs"], "a real execution should still produce outputs"
+
+
 def test_outputs_reused_on_cache_hit(stack):
     _, asset, _ = stack.upload("cat.png", _PNG, "image/png")
     status, job, raw = stack.request(

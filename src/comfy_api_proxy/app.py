@@ -296,10 +296,18 @@ class Proxy:
 
     # -- job status mapping --------------------------------------------------
     def _outputs_reused(self, entry: dict[str, Any]) -> bool:
-        """True when ComfyUI history reports ``execution_cached``."""
+        """True when ComfyUI actually served nodes from its execution cache.
+
+        ComfyUI emits ``execution_cached`` on *every* run — with an empty
+        ``nodes`` list when it cached nothing — so the message's presence alone
+        says nothing. Only a non-empty node list means outputs were reused.
+        """
         messages = (entry.get("status") or {}).get("messages") or []
-        for ev, _data in messages:
-            if ev == "execution_cached":
+        for message in messages:
+            if not isinstance(message, (list, tuple)) or len(message) != 2:
+                continue
+            ev, data = message
+            if ev == "execution_cached" and isinstance(data, dict) and data.get("nodes"):
                 return True
         return False
 
