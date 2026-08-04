@@ -4,6 +4,7 @@ errors, metadata, list-jobs, from-path, health (GitHub #18).
 
 from __future__ import annotations
 
+import json
 import time
 from typing import Any
 
@@ -192,20 +193,88 @@ def test_state_dir_survives_proxy_restart(tmp_path, make_stack):
         cleanup2()
 
 
+def test_state_store_is_owner_only(tmp_path):
+    """The DB holds the output-id HMAC secret — no group/other access."""
+    import os
+    import stat
+
+    from comfy_api_proxy.persist import StateStore
+
+    state_dir = tmp_path / "state"
+    store = StateStore(state_dir / "state.sqlite3")
+    try:
+        dir_mode = stat.S_IMODE(os.stat(state_dir).st_mode)
+        db_mode = stat.S_IMODE(os.stat(state_dir / "state.sqlite3").st_mode)
+        assert dir_mode & (stat.S_IRWXG | stat.S_IRWXO) == 0, oct(dir_mode)
+        assert db_mode & (stat.S_IRWXG | stat.S_IRWXO) == 0, oct(db_mode)
+    finally:
+        store.close()
+
+
+async def test_list_jobs_scan_is_bounded():
+    """A `status` filter must not walk every record a long-lived --state-dir
+    accumulated: GET /jobs costs up to two upstream calls per candidate."""
+    from datetime import datetime, timezone
+
+    from comfy_api_proxy.app import _MAX_JOB_SCAN, Proxy
+
+    calls = {"n": 0}
+
+    class _Resp:
+        status = 200
+        content_type = "application/json"
+
+        async def json(self):
+            return {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return False
+
+    class _Session:
+        def get(self, url, params=None, headers=None):  # noqa: ANN001
+            calls["n"] += 1
+            return _Resp()
+
+    class _Req:
+        scheme = "http"
+        host = "127.0.0.1:8189"
+        headers: dict[str, str] = {}
+        rel_url = type("_U", (), {"query": {"status": "queued"}})()
+
+    proxy = Proxy("http://comfy")
+    proxy._session = _Session()  # type: ignore[assignment]
+    overflow = _MAX_JOB_SCAN * 2
+    for i in range(overflow):
+        proxy._jobs[f"{i:08d}-0000-0000-0000-000000000000"] = {
+            "created_at": datetime.now(timezone.utc),
+            "client_id": "c",
+            "metadata": None,
+            "priority": None,
+        }
+
+    resp = await proxy.list_jobs(_Req())  # type: ignore[arg-type]
+    body = json.loads(resp.body)
+    assert body["jobs"] == []
+    assert body["truncated"] is True
+    # Two upstream calls per scanned candidate, and never more than the cap.
+    assert calls["n"] <= 2 * _MAX_JOB_SCAN
+    assert calls["n"] < 2 * overflow
+
+
 def test_server_argv_includes_state_dir():
-    from argparse import Namespace
+    """Parse through the real parser — a hand-built Namespace goes stale the
+    moment any other server flag is added."""
+    import argparse
 
-    from comfy_api_proxy.cli import _server_argv
+    from comfy_api_proxy.cli import _add_server_args, _server_argv
 
-    args = Namespace(
-        comfyui="http://127.0.0.1:8188",
-        host="127.0.0.1",
-        port=8189,
-        max_upload_mb=100,
-        token=None,
-        comfyui_base_dir=None,
-        allow_insecure_bind=False,
-        state_dir="/tmp/proxy-state",
+    parser = argparse.ArgumentParser()
+    _add_server_args(parser)
+    args = parser.parse_args(
+        ["--comfyui", "http://127.0.0.1:8188", "--state-dir", "/tmp/proxy-state"]
     )
     argv = _server_argv(args)
     assert "--state-dir" in argv

@@ -94,7 +94,7 @@ Wraps ComfyUI's native HTTP + WebSocket API one-to-one:
 | v2 operation | Backed by |
 |---|---|
 | `POST /api/v2/jobs` | Resolves any `core/ASSET` reference in the workflow to the filename ComfyUI expects, then `POST /prompt` |
-| `GET /api/v2/jobs` | Lists jobs this proxy recorded (optional `status` / `limit`); proxy-local |
+| `GET /api/v2/jobs` | Lists jobs this proxy recorded (optional `status` / `limit`), newest first, with `truncated` when the scan stopped early; proxy-local |
 | `GET /api/v2/jobs/{id}` | `GET /history/{id}` (+ `/queue` while queued/running) — the authoritative, pollable state |
 | `POST /api/v2/jobs/{id}/cancel` | ComfyUI's atomic `POST /api/jobs/{id}/cancel` |
 | `GET /api/v2/jobs/{id}/events` | Server-Sent Events, driven by ComfyUI's `/ws` (the only live signal ComfyUI exposes) |

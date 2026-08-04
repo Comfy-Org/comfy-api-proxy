@@ -11,6 +11,7 @@ Not a substitute for ComfyUI's ``--database-url`` asset catalog
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from datetime import datetime
@@ -59,14 +60,28 @@ CREATE TABLE IF NOT EXISTS asset_hash_index (
 """
 
 
+def _chmod_quietly(target: Path, mode: int) -> None:
+    """Best-effort chmod — filesystems without POSIX modes must not be fatal."""
+    try:
+        os.chmod(target, mode)
+    except OSError:
+        pass
+
+
 class StateStore:
     """Thread-safe (check_same_thread=False + lock) SQLite state for one proxy."""
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # The DB holds the HMAC secret for output asset ids: owner-only, or any
+        # local user could read it and mint valid ids. chmod after mkdir/connect
+        # because umask masks the mode= argument. 0700 on the directory also
+        # covers the WAL/SHM sidecars, which SQLite creates itself.
+        _chmod_quietly(self.path.parent, 0o700)
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
+        _chmod_quietly(self.path, 0o600)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
@@ -116,26 +131,27 @@ class StateStore:
             )
             self._conn.commit()
 
-    def load_jobs(self) -> dict[str, dict[str, Any]]:
+    def load_jobs(self, limit: int) -> dict[str, dict[str, Any]]:
+        """Newest ``limit`` job records, without their stored workflow graphs.
+
+        ``workflow`` is write-only today (kept for forensics), and hydrating one
+        graph per job is what makes a long-lived --state-dir expensive to start.
+        """
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, created_at, client_id, metadata, priority, workflow FROM jobs"
+                "SELECT id, created_at, client_id, metadata, priority FROM jobs "
+                "ORDER BY created_at DESC LIMIT ?",
+                (limit,),
             ).fetchall()
         out: dict[str, dict[str, Any]] = {}
-        for row in rows:
+        for row in reversed(rows):  # oldest-first so dict order stays FIFO
             out[str(row["id"])] = {
                 "created_at": datetime.fromisoformat(str(row["created_at"])),
                 "client_id": str(row["client_id"]),
                 "metadata": row["metadata"],
                 "priority": row["priority"],
-                "workflow": json.loads(str(row["workflow"] or "{}")),
             }
         return out
-
-    def list_job_ids(self) -> list[str]:
-        with self._lock:
-            rows = self._conn.execute("SELECT id FROM jobs ORDER BY created_at DESC").fetchall()
-        return [str(r["id"]) for r in rows]
 
     # -- idempotency ---------------------------------------------------------
     def claim_idempotency(self, key: str, *, claimed_at: str, job_id: str | None = None) -> bool:
@@ -155,13 +171,6 @@ class StateStore:
         with self._lock:
             self._conn.execute("DELETE FROM idempotency_keys WHERE key = ?", (key,))
             self._conn.commit()
-
-    def has_idempotency(self, key: str) -> bool:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT 1 FROM idempotency_keys WHERE key = ?", (key,)
-            ).fetchone()
-        return row is not None
 
     def load_idempotency_keys(self) -> list[str]:
         """Oldest-first so callers can rebuild an OrderedDict with FIFO eviction."""

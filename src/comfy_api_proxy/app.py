@@ -88,6 +88,11 @@ _MAX_PRIORITY = 1_000_000
 
 _MAX_LIST_JOBS = 100
 _DEFAULT_LIST_JOBS = 50
+# GET /jobs resolves each candidate against ComfyUI (up to two upstream calls
+# per job), so a `status` filter that matches little would otherwise walk every
+# record a long-lived --state-dir has accumulated. Cap the walk and tell the
+# caller when it stopped early. Also caps how many records are reloaded at boot.
+_MAX_JOB_SCAN = 500
 
 
 def _error(status: int, code: str, message: str, **details: Any) -> web.Response:
@@ -199,7 +204,7 @@ class Proxy:
         else:
             store.set_meta("asset_secret", self._asset_secret.hex())
         self.assets.attach_persist(store)
-        self._jobs = store.load_jobs()
+        self._jobs = store.load_jobs(_MAX_JOB_SCAN)
         for key in store.load_idempotency_keys():
             self._idempotency_keys[key] = None
 
@@ -758,9 +763,11 @@ class Proxy:
             reverse=True,
         )
         jobs: list[dict[str, Any]] = []
+        scanned = 0
         for job_id in job_ids:
-            if len(jobs) >= limit:
+            if len(jobs) >= limit or scanned >= _MAX_JOB_SCAN:
                 break
+            scanned += 1
             try:
                 state = await self._status_of(job_id, base)
             except UpstreamUnreachable:
@@ -769,7 +776,10 @@ class Proxy:
             if status_filter is not None and job["status"] not in status_filter:
                 continue
             jobs.append(job)
-        return web.json_response({"jobs": jobs})
+        # True when the scan cap stopped us before `limit` was satisfied, so a
+        # caller can tell "no more matches" apart from "stopped looking".
+        truncated = len(jobs) < limit and scanned < len(job_ids)
+        return web.json_response({"jobs": jobs, "truncated": truncated})
 
     async def get_job(self, request: web.Request) -> web.Response:
         job_id = request.match_info["id"]
