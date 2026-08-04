@@ -94,8 +94,9 @@ def _add_server_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--state-dir",
         default=None,
-        help="Directory for durable SQLite state (jobs, idempotency keys, "
-        "asset index, signing secret). Opt-in; see docs/batch-workloads.md.",
+        help="Directory for proxy-layer SQLite state (jobs, idempotency keys, "
+        "asset index, signing secret). Opt-in; not ComfyUI's asset DB — "
+        "see docs/batch-workloads.md.",
     )
 
 

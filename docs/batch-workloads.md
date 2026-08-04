@@ -14,10 +14,18 @@ Cloud). Four ComfyUI instances ⇒ four proxies (each with its own `--comfyui`,
 Without `--state-dir`, job records, `Idempotency-Key` claims, the asset index,
 and the output-id signing secret are process-local.
 
-With `--state-dir`, those proxy records write through to SQLite and reload on
-startup. That does **not** make ComfyUI `/history` or on-disk outputs durable —
-missing upstream bytes surface as `404 output_unavailable`. Each `--state-dir`
-is local to one proxy↔ComfyUI pair.
+With `--state-dir`, those **proxy-layer** records write through to SQLite and
+reload on startup. Each `--state-dir` is local to one proxy↔ComfyUI pair.
+
+This is separate from ComfyUI's own SQLite (`--database-url`, used by the
+optional `--enable-assets` catalog of models/files/tags). ComfyUI does not
+persist the v2 job queue, history, or `Idempotency-Key` mappings across
+process restart — `PromptQueue.history` stays in memory — so the proxy cannot
+delegate those concerns upstream today. Enabling ComfyUI's asset DB does
+**not** replace `--state-dir`.
+
+`--state-dir` also does **not** make ComfyUI `/history` or on-disk outputs
+durable — missing upstream bytes surface as `404 output_unavailable`.
 
 ## Advisory priority
 

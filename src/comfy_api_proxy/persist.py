@@ -1,8 +1,11 @@
 """Optional SQLite-backed durable state for a single proxy process.
 
-Persists job records, ``Idempotency-Key`` claims, the asset index, and the
-HMAC secret for output asset ids. Write-through behind in-memory indexes;
-one proxy ↔ one ComfyUI (see ``docs/batch-workloads.md``).
+Persists proxy-layer job records, ``Idempotency-Key`` claims, the asset
+index, and the HMAC secret for output asset ids. Write-through behind
+in-memory indexes; one proxy ↔ one ComfyUI (see ``docs/batch-workloads.md``).
+
+Not a substitute for ComfyUI's ``--database-url`` asset catalog
+(``--enable-assets``), which does not store v2 jobs or idempotency keys.
 """
 
 from __future__ import annotations

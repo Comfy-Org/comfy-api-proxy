@@ -215,7 +215,7 @@ comfy-api-proxy --comfyui http://127.0.0.1:8188 --port 8189 [options]
 | `--comfyui-base-dir` | *(unset)* | Filesystem root of a co-located ComfyUI install. Required to enable direct model-directory placement of model-file uploads; without it, model uploads are rejected (workflow-input uploads still work). |
 | `--max-upload-mb` | `100` | Max single-request upload size, in MB. |
 | `--allow-insecure-bind` | `false` | Permit binding a non-loopback `--host` without a `--token`. Unsafe — exposes an unauthenticated proxy to the network. |
-| `--state-dir` | *(unset)* | Opt-in SQLite durability for job records, idempotency keys, the asset index, and the output-id signing secret. See [docs/batch-workloads.md](docs/batch-workloads.md). |
+| `--state-dir` | *(unset)* | Opt-in proxy-layer SQLite for job records, idempotency keys, the asset index, and the output-id signing secret (separate from ComfyUI's asset catalog). See [docs/batch-workloads.md](docs/batch-workloads.md). |
 
 ## SDKs and the API contract
 
@@ -284,9 +284,11 @@ Batch topology, durability, priority, and cancel:
 
 Known limitations:
 
-- **`--state-dir` is opt-in.** Proxy records (jobs, idempotency, assets,
-  signing secret) survive restarts; ComfyUI history / output files do not
-  (`404 output_unavailable` when bytes are gone).
+- **`--state-dir` is opt-in.** Proxy records (jobs, idempotency, asset index,
+  signing secret) survive restarts. This is not ComfyUI's asset-catalog
+  SQLite (`--database-url` / `--enable-assets`); history and output files
+  remain ComfyUI's responsibility (`404 output_unavailable` when bytes are
+  gone).
 - **One proxy ↔ one ComfyUI.** Multi-backend routing is out of scope.
 - **`priority` is advisory only** — never mapped to ComfyUI `front: true`.
 - **Proxy-local extensions** are not yet in the synced Cloud OpenAPI
