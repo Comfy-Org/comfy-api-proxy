@@ -191,7 +191,9 @@ configuration:
 - **A default-on origin-check middleware** — ported from ComfyUI core's own
   `create_origin_only_middleware` — rejects cross-site browser requests even
   when nothing else is configured, closing the DNS-rebinding / drive-by-CSRF
-  hole any unauthenticated localhost server is exposed to.
+  hole any unauthenticated localhost server is exposed to. Opt in a hosted
+  web app with `--enable-cors-header <origin>` (repeatable; `*` refused) —
+  see [Browser access](docs/browser-access.md).
 - **Model-file uploads are safetensors-only, with path-traversal and
   symlink-escape guards** (see *Model-file uploads* above) — and are
   rejected outright unless the proxy was started co-located with
@@ -212,6 +214,19 @@ comfy-api-proxy --comfyui http://127.0.0.1:8188 --port 8189 [options]
 | `--comfyui-base-dir` | *(unset)* | Filesystem root of a co-located ComfyUI install. Required to enable direct model-directory placement of model-file uploads; without it, model uploads are rejected (workflow-input uploads still work). |
 | `--max-upload-mb` | `100` | Max single-request upload size, in MB. |
 | `--allow-insecure-bind` | `false` | Permit binding a non-loopback `--host` without a `--token`. Unsafe — exposes an unauthenticated proxy to the network. |
+| `--enable-cors-header` | *(unset)* | Allow a browser `Origin` to call this proxy (repeatable). Explicit origins only — `*` is refused. See [Browser access](docs/browser-access.md). |
+
+## Browser access (hosted origin → local proxy)
+
+```bash
+comfy-api-proxy --enable-cors-header https://your-app.example --token "$LOCAL_PROXY_TOKEN"
+```
+
+Enables CORS preflight, `Authorization` / `Idempotency-Key`, exposes
+`Retry-After` / range headers, and makes `GET /api/v2/health` readable from
+the allowlisted Origin. `@comfyorg/sdk` stays Node-only for v1 — browser apps
+should use `fetch` against `/api/v2/*`. Details:
+[docs/browser-access.md](docs/browser-access.md).
 
 ## SDKs and the API contract
 

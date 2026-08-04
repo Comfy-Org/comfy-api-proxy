@@ -64,6 +64,20 @@ class Stack:
         *,
         headers: dict[str, str] | None = None,
     ) -> tuple[int, Any, bytes]:
+        status, parsed, raw, _resp_headers = self.request_with_headers(
+            method, path, body, headers=headers
+        )
+        return status, parsed, raw
+
+    def request_with_headers(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, Any, bytes, dict[str, str]]:
+        """Like :meth:`request`, but also returns response headers (lower-cased keys)."""
         url = self.base + path if path.startswith("/") else path
         data = json.dumps(body).encode() if body is not None else None
         hdrs = dict(headers or {})
@@ -75,14 +89,14 @@ class Stack:
                 raw = r.read()
                 ctype = r.headers.get("Content-Type", "")
                 parsed = json.loads(raw) if "application/json" in ctype else None
-                return r.status, parsed, raw
+                return r.status, parsed, raw, {k.lower(): v for k, v in r.headers.items()}
         except urllib.error.HTTPError as e:
             raw = e.read()
             try:
                 parsed = json.loads(raw)
             except Exception:
                 parsed = None
-            return e.code, parsed, raw
+            return e.code, parsed, raw, {k.lower(): v for k, v in e.headers.items()}
 
     def upload(
         self, file_path: str, content: bytes, content_type: str, **fields: str
@@ -160,6 +174,7 @@ def _make_stack(
     comfyui_base_dir: str | None = None,
     token: str | None = None,
     max_upload_mb: int | None = None,
+    cors_origins: list[str] | None = None,
 ):
     """Spawn fake ComfyUI + the real proxy on free ports; yield a Stack driver."""
     procs: list[tuple[subprocess.Popen, str, Path]] = []
@@ -198,6 +213,8 @@ def _make_stack(
         proxy_args += ["--token", token]
     if max_upload_mb is not None:
         proxy_args += ["--max-upload-mb", str(max_upload_mb)]
+    for origin in cors_origins or []:
+        proxy_args += ["--enable-cors-header", origin]
     _spawn(proxy_args, proxy_port, "proxy")
 
     stack = Stack(f"http://127.0.0.1:{proxy_port}", comfyui_port, proxy_port)
@@ -257,5 +274,29 @@ def stack_with_models_dir(tmp_path) -> Any:
     s, cleanup = _make_stack(tmp_path, comfyui_base_dir=str(base_dir))
     try:
         yield s, base_dir
+    finally:
+        cleanup()
+
+
+@pytest.fixture
+def stack_with_cors(tmp_path) -> Any:
+    """Proxy with an explicit browser-origin allowlist (hosted app → localhost)."""
+    s, cleanup = _make_stack(tmp_path, cors_origins=["https://app.example.com"])
+    try:
+        yield s
+    finally:
+        cleanup()
+
+
+@pytest.fixture
+def stack_with_cors_and_token(tmp_path) -> Any:
+    """CORS allowlist plus bearer token — mirrors a hardened local browser setup."""
+    s, cleanup = _make_stack(
+        tmp_path,
+        token="secret",
+        cors_origins=["https://app.example.com"],
+    )
+    try:
+        yield s
     finally:
         cleanup()
