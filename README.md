@@ -215,7 +215,7 @@ comfy-api-proxy --comfyui http://127.0.0.1:8188 --port 8189 [options]
 | `--comfyui-base-dir` | *(unset)* | Filesystem root of a co-located ComfyUI install. Required to enable direct model-directory placement of model-file uploads; without it, model uploads are rejected (workflow-input uploads still work). |
 | `--max-upload-mb` | `100` | Max single-request upload size, in MB. |
 | `--allow-insecure-bind` | `false` | Permit binding a non-loopback `--host` without a `--token`. Unsafe — exposes an unauthenticated proxy to the network. |
-| `--state-dir` | *(unset)* | Opt-in SQLite durability for job records, idempotency keys, the asset index, and the output-id signing secret. See [docs/topology-and-deployment.md](docs/topology-and-deployment.md). |
+| `--state-dir` | *(unset)* | Opt-in SQLite durability for job records, idempotency keys, the asset index, and the output-id signing secret. See [docs/batch-workloads.md](docs/batch-workloads.md). |
 
 ## SDKs and the API contract
 
@@ -276,29 +276,21 @@ a regeneration gets caught immediately instead of drifting silently. See
 Implemented: submit (with `core/ASSET` resolution), poll, cancel, live SSE
 events, asset upload/download, from-hash/by-hash dedup, guarded
 model-directory placement, optional `--state-dir` persistence, caller
-`metadata` / advisory `priority`, `GET /jobs` listing, `outputs_reused`,
+`metadata` / advisory `priority`, `GET /jobs`, `outputs_reused`,
 `POST /assets/from-path`, and `GET /health`.
 
-Topology, durability boundaries, priority semantics, and cancellation
-pointers: [docs/topology-and-deployment.md](docs/topology-and-deployment.md),
-[docs/advisory-priority.md](docs/advisory-priority.md),
-[docs/cancellation.md](docs/cancellation.md).
+Batch topology, durability, priority, and cancel:
+[docs/batch-workloads.md](docs/batch-workloads.md).
 
 Known limitations:
 
-- **`--state-dir` is opt-in.** Without it, job records, idempotency claims,
-  the asset index, and the signing secret are process-local (lost on restart).
-  With it, those *proxy* records survive — ComfyUI history / output files still
-  do not; missing upstream bytes surface as `404 output_unavailable` on
-  download, without rewriting a job's `succeeded` status.
-- **One proxy ↔ one ComfyUI.** Multi-backend routing is out of scope; run one
-  proxy per instance and schedule above this layer.
-- **`priority` is advisory only.** Stored and echoed; never mapped to ComfyUI's
-  `front: true` stack push.
-- **Proxy-local extensions** (`metadata`, `outputs_reused`, `GET /jobs`,
-  `from-path`, `output_unavailable`) are not yet in the synced Cloud OpenAPI
-  (`spec/openapi.yaml` is one-way from upstream and is not hand-edited here).
-- **Uploads still buffer.** Large multipart uploads are read fully into memory /
-  a temp file rather than true streaming; `from-path` avoids the copy when the
-  file already lives under `--comfyui-base-dir`.
+- **`--state-dir` is opt-in.** Proxy records (jobs, idempotency, assets,
+  signing secret) survive restarts; ComfyUI history / output files do not
+  (`404 output_unavailable` when bytes are gone).
+- **One proxy ↔ one ComfyUI.** Multi-backend routing is out of scope.
+- **`priority` is advisory only** — never mapped to ComfyUI `front: true`.
+- **Proxy-local extensions** are not yet in the synced Cloud OpenAPI
+  (`spec/openapi.yaml` is one-way from upstream; not hand-edited here).
+- **Uploads still buffer**; `from-path` avoids the copy when the file already
+  lives under `--comfyui-base-dir`.
 

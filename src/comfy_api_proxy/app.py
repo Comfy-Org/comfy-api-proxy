@@ -80,15 +80,9 @@ _RETENTION = timedelta(hours=24)
 _MAX_IDEMPOTENCY_KEY_LEN = 255
 _MAX_IDEMPOTENCY_KEYS = 10_000
 
-# Caller-owned opaque job label (see GitHub #18). Bytes, not chars:
-# a 1 KiB UTF-8 cap is generous for attribution labels and rejects accidental
-# base64 blob stuffing without needing a queryable structured schema.
+# Opaque job label (≤1 KiB UTF-8). Advisory priority — stored/echoed only;
+# never mapped to ComfyUI `front: true` (see docs/batch-workloads.md).
 _MAX_METADATA_BYTES = 1024
-
-# Advisory numeric priority. Stored and echoed; backends MAY ignore or reorder.
-# Local ComfyUI does not offer a true priority lane (only `front: true` stack
-# push), so this proxy never maps priority onto that trap — see
-# docs/advisory-priority.md.
 _MIN_PRIORITY = -1_000_000
 _MAX_PRIORITY = 1_000_000
 
@@ -184,19 +178,14 @@ class Proxy:
         # job_id -> {"workflow": ..., "created_at": datetime, "client_id": str,
         #            "metadata": str|None, "priority": int|None}
         self._jobs: dict[str, dict[str, Any]] = {}
-        # Claimed Idempotency-Key values (single-use, reject-on-duplicate — no
-        # replay, matching the v2 contract). Bounded in size (see
-        # _MAX_IDEMPOTENCY_KEYS) with FIFO eviction; an OrderedDict is used as
-        # an ordered set so the oldest claim can be popped when the cap is
-        # reached. With --state-dir the claims also survive process restart.
+        # Claimed Idempotency-Key values (single-use). Bounded FIFO OrderedDict;
+        # with --state-dir claims also survive restart.
         self._idempotency_keys: collections.OrderedDict[str, None] = collections.OrderedDict()
         self._session: ClientSession | None = None
         self._open_streams = 0
         self._store: StateStore | None = None
-        # Per-process secret used to HMAC-sign stateless output asset ids
-        # (see _asset_id / _decode_asset_id). Random when ephemeral; when a
-        # state dir is configured the secret is loaded/persisted so output
-        # asset ids from a prior process remain verifiable. Never logged.
+        # HMAC secret for output asset ids. Persisted under --state-dir so
+        # ids from a prior process remain verifiable. Never logged.
         self._asset_secret = os.urandom(32)
         if state_dir is not None:
             self._load_state(Path(state_dir))
@@ -302,13 +291,7 @@ class Proxy:
 
     # -- job status mapping --------------------------------------------------
     def _outputs_reused(self, entry: dict[str, Any]) -> bool:
-        """True when ComfyUI answered from its execution cache.
-
-        A cache hit reports ``status_str=success`` while emitting
-        ``execution_cached`` (and often empty SaveImage outputs). Callers
-        need a typed signal — an empty ``outputs`` array alone is ambiguous
-        with a workflow that truly produces nothing.
-        """
+        """True when ComfyUI history reports ``execution_cached``."""
         messages = (entry.get("status") or {}).get("messages") or []
         for ev, _data in messages:
             if ev == "execution_cached":
@@ -444,8 +427,7 @@ class Proxy:
                 "cancel": f"{base}/api/v2/jobs/{job_id}/cancel",
             },
         }
-        # Optional caller fields — omit when unset so responders that treat
-        # unknown nulls strictly still validate; present only when supplied.
+        # Omit unset optional fields so strict clients still validate.
         if meta.get("metadata") is not None:
             body["metadata"] = meta["metadata"]
         if meta.get("priority") is not None:
@@ -479,7 +461,7 @@ class Proxy:
         if self._store is not None and not self._store.claim_idempotency(
             key, claimed_at=_iso(_now())
         ):
-            # Durable claim from a prior process (or a lost race) — mirror it.
+            # Already claimed in a prior process (or race) — mirror into memory.
             self._idempotency_keys[key] = None
             return False
         self._idempotency_keys[key] = None
@@ -735,12 +717,7 @@ class Proxy:
         )
 
     async def list_jobs(self, request: web.Request) -> web.Response:
-        """List jobs this proxy recorded (caller-owned on a single-user host).
-
-        Optional ``status`` is a comma-separated filter; ``limit`` caps the
-        refresh fan-out against ComfyUI. ``queue_position`` is filled when the
-        local backend can answer and is null otherwise.
-        """
+        """List jobs this proxy recorded. Optional ``status`` / ``limit``."""
         limit_raw = request.rel_url.query.get("limit", str(_DEFAULT_LIST_JOBS))
         try:
             limit = int(limit_raw)
@@ -774,7 +751,6 @@ class Proxy:
                 )
 
         base = _external_base(request)
-        # Newest first — matches dashboard "what just happened" and cron UIs.
         epoch = datetime.min.replace(tzinfo=timezone.utc)
         job_ids = sorted(
             self._jobs.keys(),
@@ -1201,10 +1177,7 @@ class Proxy:
         if upstream.status not in (200, 206):
             status = upstream.status
             upstream.release()
-            # A genuine 404 means the bytes are gone (history can outlive the
-            # file after an archive sweep). Retrying cannot help; surface a
-            # typed code so callers reseed / re-execute instead of treating it
-            # as a transient not_found.
+            # Typed signal: output bytes are gone (not a transient miss).
             if status == 404:
                 return _error(
                     404,
@@ -1246,13 +1219,7 @@ class Proxy:
         return body
 
     async def asset_from_path(self, request: web.Request) -> web.Response:
-        """Register a host-local file as an asset without copying bytes.
-
-        The path must resolve under the co-located ComfyUI install
-        (``--comfyui-base-dir``): ``input/``, ``output/``, ``temp/``, or
-        ``models/<allowlisted>/``. Hashing still reads the file for dedup;
-        ComfyUI is not asked to re-accept an upload it already owns.
-        """
+        """Register a host file under ``--comfyui-base-dir`` without copying."""
         if self.base_dir is None:
             return _error(
                 422,
@@ -1278,7 +1245,7 @@ class Proxy:
         if not src.is_file():
             return _error(404, "blob_not_found", "Host path is not a regular file.")
 
-        # Containment: resolved path must live under the ComfyUI install root.
+        # Path must resolve under --comfyui-base-dir.
         try:
             rel = src.relative_to(self.base_dir)
         except ValueError:
@@ -1373,8 +1340,7 @@ class Proxy:
         return web.json_response(self._asset_json(record, created_new=True, base=base), status=201)
 
     async def health(self, request: web.Request) -> web.Response:
-        # Intentionally does not probe ComfyUI — a cheap reachability signal
-        # for the proxy process itself (see GitHub #18 item 7).
+        # Does not probe ComfyUI — process reachability only.
         return web.json_response({"status": "healthy", "upstream": self.comfyui})
 
 

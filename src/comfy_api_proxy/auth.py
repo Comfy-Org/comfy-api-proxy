@@ -34,9 +34,7 @@ def make_bearer_auth_middleware(token: str) -> Middleware:
 
     @web.middleware
     async def bearer_auth_middleware(request: web.Request, handler: Handler) -> web.StreamResponse:
-        # Cheap health probe stays unauthenticated so schedulers can check
-        # process reachability without a credential (GitHub #18). CORS for
-        # browser health probes is a separate browser-access track — not here.
+        # Health is unauthenticated so schedulers can probe without a credential.
         if request.path == "/api/v2/health":
             return await handler(request)
         if not request.path.startswith("/api/v2/"):

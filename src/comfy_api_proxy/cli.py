@@ -95,8 +95,7 @@ def _add_server_args(parser: argparse.ArgumentParser) -> None:
         "--state-dir",
         default=None,
         help="Directory for durable SQLite state (jobs, idempotency keys, "
-        "asset index, signing secret). Opt-in; without it those records are "
-        "process-local. See docs/topology-and-deployment.md.",
+        "asset index, signing secret). Opt-in; see docs/batch-workloads.md.",
     )
 
 

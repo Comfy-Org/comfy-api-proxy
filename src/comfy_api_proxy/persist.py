@@ -1,18 +1,8 @@
 """Optional SQLite-backed durable state for a single proxy process.
 
-Persists the three things that make multi-day batch workloads survivable
-across a proxy restart (while ComfyUI itself keeps running):
-
-  * job records (id, created_at, client_id, opaque metadata, advisory priority)
-  * claimed ``Idempotency-Key`` values (so crash-and-resubmit stays single-use)
-  * the content-addressed asset index (and the per-deploy HMAC secret used to
-    mint stateless output asset ids)
-
-This is intentionally a write-through store behind the in-memory indexes the
-handlers already use — the hot path stays dict lookups; SQLite only has to
-keep the durable copy current and reload it on startup. One proxy serves one
-ComfyUI (see ``docs/topology-and-deployment.md``); the DB is local to that
-pairing and is never a shared multi-backend queue.
+Persists job records, ``Idempotency-Key`` claims, the asset index, and the
+HMAC secret for output asset ids. Write-through behind in-memory indexes;
+one proxy ↔ one ComfyUI (see ``docs/batch-workloads.md``).
 """
 
 from __future__ import annotations
