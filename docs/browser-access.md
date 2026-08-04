@@ -19,7 +19,10 @@ comfy-api-proxy \
   `Retry-After`, `Content-Range`, and `Accept-Ranges` on responses.
 - `GET /api/v2/health` is readable cross-origin when the Origin is allowlisted.
   Streaming responses (SSE) get the same CORS headers via `on_response_prepare`.
-- Non-allowlisted Origins keep today's `403 forbidden_origin` behaviour.
+- Non-allowlisted Origins keep today's `403 forbidden_origin` behaviour when
+  the request is cross-site or its `Origin` disagrees with a loopback `Host`.
+  A same-origin request is unaffected — the guard exists to stop cross-site
+  callers, not to require an allowlist entry for the proxy's own page.
 
 ## Security posture
 

@@ -172,5 +172,8 @@ def test_token_gate_allows_preflight_then_requires_bearer(stack_with_cors_and_to
             "Authorization": "Bearer secret",
         },
     )
-    assert authed != 401, raw  # past the gate (404 for the unknown job id is fine)
+    # Past the gate and into the handler: the job id is unknown, so the
+    # handler's own 404 is the proof — a bare "not 401" would also accept a
+    # 403 or a 500 that never reached it.
+    assert authed == 404, raw
     _assert_cors_headers(headers)
