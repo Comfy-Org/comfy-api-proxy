@@ -160,6 +160,7 @@ def _make_stack(
     comfyui_base_dir: str | None = None,
     token: str | None = None,
     max_upload_mb: int | None = None,
+    state_dir: str | None = None,
 ):
     """Spawn fake ComfyUI + the real proxy on free ports; yield a Stack driver."""
     procs: list[tuple[subprocess.Popen, str, Path]] = []
@@ -198,6 +199,8 @@ def _make_stack(
         proxy_args += ["--token", token]
     if max_upload_mb is not None:
         proxy_args += ["--max-upload-mb", str(max_upload_mb)]
+    if state_dir is not None:
+        proxy_args += ["--state-dir", state_dir]
     _spawn(proxy_args, proxy_port, "proxy")
 
     stack = Stack(f"http://127.0.0.1:{proxy_port}", comfyui_port, proxy_port)

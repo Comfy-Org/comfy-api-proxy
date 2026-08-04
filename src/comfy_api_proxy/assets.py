@@ -11,11 +11,12 @@ Two things are tracked per asset:
     ``file_path``, ``created_at``), and
   * how to actually retrieve the bytes — either a ComfyUI ``/view`` reference
     (``filename``/``subfolder``/``type``) for inputs proxied to ComfyUI, or an
-    absolute on-disk path for model files the proxy placed itself.
+    absolute on-disk path for model files the proxy placed itself (or
+    registered in place via ``from-path``).
 
-The store is in-memory and lost on restart (same durability as ComfyUI's own
-history). A durable index is a later milestone; nothing in the contract
-requires persistence, and re-uploading recomputes the same hash and dedups.
+By default the index is in-memory. When a :class:`persist.StateStore` is
+attached (``--state-dir``), mutations are write-through and reloaded on
+startup so hash dedup and asset ids survive a proxy restart.
 """
 
 from __future__ import annotations
@@ -23,6 +24,10 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .persist import StateStore
 
 
 @dataclass
@@ -37,7 +42,7 @@ class AssetRecord:
     created_at: str
     # Retrieval — exactly one of these is set.
     comfy_ref: dict[str, str] | None = None  # {filename, subfolder, type} for /view
-    disk_path: str | None = None  # absolute path for proxy-placed model files
+    disk_path: str | None = None  # absolute path for proxy-placed / host files
     tags: list[str] = field(default_factory=list)
 
 
@@ -55,6 +60,14 @@ class AssetStore:
     def __init__(self) -> None:
         self._by_id: dict[str, AssetRecord] = {}
         self._id_by_hash: dict[str, str] = {}
+        self._persist: StateStore | None = None
+
+    def attach_persist(self, store: StateStore) -> None:
+        """Hydrate from ``store`` and write through subsequent mutations."""
+        self._persist = store
+        by_id, id_by_hash = store.load_assets()
+        self._by_id = by_id
+        self._id_by_hash = id_by_hash
 
     def get(self, asset_id: str) -> AssetRecord | None:
         return self._by_id.get(asset_id)
@@ -76,10 +89,11 @@ class AssetStore:
         comfy_ref: dict[str, str] | None = None,
         disk_path: str | None = None,
         tags: list[str] | None = None,
+        asset_id: str | None = None,
     ) -> AssetRecord:
         """Mint and store a new asset record, indexing it by hash."""
         record = AssetRecord(
-            id=new_asset_id(),
+            id=asset_id or new_asset_id(),
             hash=hash_,
             size_bytes=size_bytes,
             content_type=content_type,
@@ -92,7 +106,10 @@ class AssetStore:
         self._by_id[record.id] = record
         # First writer wins the hash slot (dedup target); a later identical
         # upload resolves to this same record rather than overwriting it.
-        self._id_by_hash.setdefault(hash_, record.id)
+        if hash_:
+            self._id_by_hash.setdefault(hash_, record.id)
+        if self._persist is not None:
+            self._persist.upsert_asset(record)
         return record
 
     def register_comfy_output(
@@ -112,4 +129,6 @@ class AssetStore:
             comfy_ref={"filename": filename, "subfolder": subfolder, "type": type_},
         )
         self._by_id[record.id] = record
+        if self._persist is not None:
+            self._persist.upsert_asset(record)
         return record

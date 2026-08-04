@@ -28,11 +28,17 @@ def _forbidden(code: str, message: str) -> web.Response:
 
 def make_bearer_auth_middleware(token: str) -> Middleware:
     """Build a middleware requiring ``Authorization: Bearer <token>`` on
-    every ``/api/v2/*`` request, constant-time compared against ``token``.
+    every ``/api/v2/*`` request (except ``GET /api/v2/health``), constant-time
+    compared against ``token``.
     """
 
     @web.middleware
     async def bearer_auth_middleware(request: web.Request, handler: Handler) -> web.StreamResponse:
+        # Cheap health probe stays unauthenticated so schedulers can check
+        # process reachability without a credential (GitHub #18). CORS for
+        # browser health probes is a separate browser-access track — not here.
+        if request.path == "/api/v2/health":
+            return await handler(request)
         if not request.path.startswith("/api/v2/"):
             return await handler(request)
         header = request.headers.get("Authorization", "")

@@ -985,7 +985,11 @@ async def test_asset_content_upstream_5xx_maps_to_502_but_404_stays_404():
         async def get(self, url, params=None, headers=None):  # noqa: ANN001
             return _Resp(self._status)
 
-    cases = [(500, 502, "upstream_error"), (403, 502, "upstream_error"), (404, 404, "not_found")]
+    cases = [
+        (500, 502, "upstream_error"),
+        (403, 502, "upstream_error"),
+        (404, 404, "output_unavailable"),
+    ]
     for upstream_status, expected_status, expected_code in cases:
         proxy = Proxy("http://comfy")
         proxy._session = _Session(upstream_status)  # type: ignore[assignment]

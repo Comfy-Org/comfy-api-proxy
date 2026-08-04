@@ -91,6 +91,13 @@ def _add_server_args(parser: argparse.ArgumentParser) -> None:
         help="Permit binding a non-loopback --host without a --token. Unsafe: "
         "exposes an unauthenticated proxy to the network.",
     )
+    parser.add_argument(
+        "--state-dir",
+        default=None,
+        help="Directory for durable SQLite state (jobs, idempotency keys, "
+        "asset index, signing secret). Opt-in; without it those records are "
+        "process-local. See docs/topology-and-deployment.md.",
+    )
 
 
 def _bind_refused(args: argparse.Namespace) -> bool:
@@ -114,6 +121,7 @@ def _run_foreground(args: argparse.Namespace) -> int:
         args.comfyui,
         comfyui_base_dir=args.comfyui_base_dir,
         max_upload_bytes=args.max_upload_mb * 1024 * 1024,
+        state_dir=args.state_dir,
         middlewares=middlewares,
     )
     web.run_app(app, host=args.host, port=args.port)
@@ -138,6 +146,8 @@ def _server_argv(args: argparse.Namespace) -> list[str]:
         argv += ["--comfyui-base-dir", args.comfyui_base_dir]
     if args.allow_insecure_bind:
         argv += ["--allow-insecure-bind"]
+    if args.state_dir:
+        argv += ["--state-dir", args.state_dir]
     return argv
 
 

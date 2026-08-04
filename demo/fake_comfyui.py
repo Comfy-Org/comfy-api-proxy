@@ -92,6 +92,12 @@ async def prompt(request: web.Request) -> web.Response:
         and node["inputs"].get("hang") is True
         for node in graph.values()
     )
+    cache_hit = any(
+        isinstance(node, dict)
+        and isinstance(node.get("inputs"), dict)
+        and node["inputs"].get("cache_hit") is True
+        for node in graph.values()
+    )
     # A workflow may set `complete_after_seconds` on any node to control how
     # long the fake stays running — lets a test connect its SSE stream before
     # the job completes without racing the default 0.2s timer.
@@ -103,8 +109,9 @@ async def prompt(request: web.Request) -> web.Response:
                 complete_after = float(v)
     _jobs[prompt_id] = {
         "state": "running",
-        "outputs": _default_outputs(),
+        "outputs": {} if cache_hit else _default_outputs(),
         "hang": hang,
+        "cache_hit": cache_hit,
         "client_id": client_id,
         # Record what the proxy forwarded so a test can prove extra_data
         # (partner-node auth) rode the /prompt body verbatim. `present` captures
@@ -127,6 +134,17 @@ def _history_entry(job: dict) -> dict:
                 "status_str": "error",
                 "completed": False,
                 "messages": [["execution_interrupted", {}]],
+            },
+        }
+    if job.get("cache_hit"):
+        # Mimic ComfyUI execution-cache reuse: success + execution_cached,
+        # typically with no new SaveImage outputs.
+        return {
+            "outputs": {},
+            "status": {
+                "status_str": "success",
+                "completed": True,
+                "messages": [["execution_cached", {"nodes": []}]],
             },
         }
     return {
