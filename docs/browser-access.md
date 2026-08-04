@@ -17,9 +17,8 @@ comfy-api-proxy \
 - Allowlisted Origins get CORS preflight (`OPTIONS` → `204`), may send
   `Authorization` / `Content-Type` / `Idempotency-Key`, and can read
   `Retry-After`, `Content-Range`, and `Accept-Ranges` on responses.
-- `GET /api/v2/health` is readable cross-origin when the Origin is allowlisted
-  (still requires `--token` if configured). Streaming responses (SSE) get the
-  same CORS headers via `on_response_prepare`.
+- `GET /api/v2/health` is readable cross-origin when the Origin is allowlisted.
+  Streaming responses (SSE) get the same CORS headers via `on_response_prepare`.
 - Non-allowlisted Origins keep today's `403 forbidden_origin` behaviour.
 
 ## Security posture

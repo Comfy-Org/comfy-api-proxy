@@ -64,12 +64,12 @@ async def test_non_v2_path_bypasses_the_gate():
 
 
 async def test_options_preflight_bypasses_the_gate():
-    """CORS preflight never carries Authorization; the gate must not 401 it."""
-    resp, ran = await _invoke(
-        make_bearer_auth_middleware("secret"),
-        {},
-        path="/api/v2/health",
-    )
+    """CORS preflight never carries Authorization; the gate must not 401 it.
+
+    Uses a guarded job path, not /api/v2/health — health has its own
+    unauthenticated carve-out, which would mask what this asserts.
+    """
+    resp, ran = await _invoke(make_bearer_auth_middleware("secret"), {})
     # GET without token still rejects — control for the OPTIONS case below.
     assert resp.status == 401
     assert not ran
@@ -82,7 +82,7 @@ async def test_options_preflight_bypasses_the_gate():
 
     mw = make_bearer_auth_middleware("secret")
     resp = await mw(
-        make_mocked_request("OPTIONS", "/api/v2/health", headers={}),
+        make_mocked_request("OPTIONS", "/api/v2/jobs/x", headers={}),
         handler,
     )
     assert resp.status == 204

@@ -131,9 +131,15 @@ def test_default_proxy_still_blocks_hosted_origin(stack):
 
 
 def test_token_gate_allows_preflight_then_requires_bearer(stack_with_cors_and_token):
+    """Preflight is unauthenticated; the real call still needs the bearer.
+
+    Probes a token-guarded job path rather than /api/v2/health, which is
+    deliberately readable without a credential so schedulers can poll it.
+    """
+    jid = "11111111-1111-1111-1111-111111111111"
     status, _body, raw, headers = stack_with_cors_and_token.request_with_headers(
         "OPTIONS",
-        "/api/v2/health",
+        f"/api/v2/jobs/{jid}",
         headers={
             "Origin": HOSTED_ORIGIN,
             "Access-Control-Request-Method": "GET",
@@ -146,7 +152,7 @@ def test_token_gate_allows_preflight_then_requires_bearer(stack_with_cors_and_to
 
     unauth, body, _raw, headers = stack_with_cors_and_token.request_with_headers(
         "GET",
-        "/api/v2/health",
+        f"/api/v2/jobs/{jid}",
         headers={
             "Origin": HOSTED_ORIGIN,
             "Sec-Fetch-Site": "cross-site",
@@ -157,15 +163,14 @@ def test_token_gate_allows_preflight_then_requires_bearer(stack_with_cors_and_to
     # 401 must still carry CORS headers so the browser can read the error body.
     _assert_cors_headers(headers)
 
-    ok, body, raw, headers = stack_with_cors_and_token.request_with_headers(
+    authed, _body, raw, headers = stack_with_cors_and_token.request_with_headers(
         "GET",
-        "/api/v2/health",
+        f"/api/v2/jobs/{jid}",
         headers={
             "Origin": HOSTED_ORIGIN,
             "Sec-Fetch-Site": "cross-site",
             "Authorization": "Bearer secret",
         },
     )
-    assert ok == 200, raw
-    assert body is not None and body.get("status") == "healthy"
+    assert authed != 401, raw  # past the gate (404 for the unknown job id is fine)
     _assert_cors_headers(headers)
