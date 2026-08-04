@@ -219,6 +219,12 @@ def _make_stack(
 
 
 @pytest.fixture
+def make_stack():
+    """Factory for Stack drivers with custom kwargs (e.g. state_dir restarts)."""
+    return _make_stack
+
+
+@pytest.fixture
 def stack(tmp_path) -> Any:
     """Spawn fake ComfyUI + proxy on free ports; yield a Stack driver."""
     s, cleanup = _make_stack(tmp_path)

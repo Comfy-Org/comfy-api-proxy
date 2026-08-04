@@ -9,8 +9,6 @@ from typing import Any
 
 import pytest
 
-from tests.conftest import _make_stack
-
 _PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108020000009077"
     "53de0000000c49444154789c6360f8cf00000301010018dd8db10000000049454e44ae426082"
@@ -38,10 +36,10 @@ def _simple_workflow(asset_id: str | None = None, **node_inputs: Any) -> dict[st
 
 
 @pytest.fixture
-def stack_with_state(tmp_path) -> Any:
+def stack_with_state(tmp_path, make_stack) -> Any:
     state_dir = tmp_path / "state"
     state_dir.mkdir()
-    s, cleanup = _make_stack(tmp_path, state_dir=str(state_dir))
+    s, cleanup = make_stack(tmp_path, state_dir=str(state_dir))
     try:
         yield s, state_dir
     finally:
@@ -140,12 +138,12 @@ def test_from_path_and_output_unavailable(stack_with_models_dir):
     assert body["error"]["code"] == "output_unavailable"
 
 
-def test_state_dir_survives_proxy_restart(tmp_path):
+def test_state_dir_survives_proxy_restart(tmp_path, make_stack):
     state_dir = tmp_path / "state"
     state_dir.mkdir()
     run_a = tmp_path / "run_a"
     run_a.mkdir()
-    stack, cleanup = _make_stack(run_a, state_dir=str(state_dir))
+    stack, cleanup = make_stack(run_a, state_dir=str(state_dir))
     try:
         _, asset, _ = stack.upload("cat.png", _PNG, "image/png")
         asset_id = asset["id"]
@@ -170,7 +168,7 @@ def test_state_dir_survives_proxy_restart(tmp_path):
     # must still resolve from SQLite.
     run_b = tmp_path / "run_b"
     run_b.mkdir()
-    stack2, cleanup2 = _make_stack(run_b, state_dir=str(state_dir))
+    stack2, cleanup2 = make_stack(run_b, state_dir=str(state_dir))
     try:
         status, asset2, raw = stack2.request("GET", f"/api/v2/assets/{asset_id}")
         assert status == 200, raw
