@@ -19,6 +19,9 @@ Security posture (the defaults are the safety net):
   * The default-on origin guard (ported from ComfyUI core) is always wired
     in, matching ComfyUI's own default; a static bearer token gates
     ``/api/v2/*`` when configured.
+  * ``--enable-cors-header <origin>`` (repeatable) is the opt-in browser
+    escape hatch: allowlisted Origins may call the loopback proxy; ``*`` is
+    refused.
 """
 
 from __future__ import annotations
@@ -32,7 +35,12 @@ from aiohttp import web
 from . import service
 from .app import _DEFAULT_MAX_UPLOAD_BYTES, make_app
 from .auth import make_bearer_auth_middleware
-from .middleware import origin_only_middleware
+from .middleware import (
+    attach_cors_prepare,
+    make_cors_middleware,
+    make_origin_only_middleware,
+    normalize_cors_origin,
+)
 
 _COMMANDS = {"run", "start", "stop", "status"}
 
@@ -98,6 +106,16 @@ def _add_server_args(parser: argparse.ArgumentParser) -> None:
         "asset index, signing secret). Opt-in; not ComfyUI's asset DB — "
         "see docs/batch-workloads.md.",
     )
+    parser.add_argument(
+        "--enable-cors-header",
+        action="append",
+        default=[],
+        metavar="ORIGIN",
+        dest="cors_origins",
+        help="Allow a browser Origin to call this proxy (repeatable). Pass an "
+        "explicit origin such as https://app.example.com. Unlike ComfyUI "
+        "core, '*' is refused — see docs/browser-access.md.",
+    )
 
 
 def _bind_refused(args: argparse.Namespace) -> bool:
@@ -111,12 +129,33 @@ def _bind_refused(args: argparse.Namespace) -> bool:
     return False
 
 
+def _parse_cors_origins(raw_origins: list[str]) -> list[str] | None:
+    """Normalize allowlisted origins, or print and return None on error."""
+    cors_origins: list[str] = []
+    for raw in raw_origins:
+        try:
+            cors_origins.append(normalize_cors_origin(raw))
+        except ValueError as exc:
+            print(f"invalid --enable-cors-header: {exc}", file=sys.stderr)
+            return None
+    return cors_origins
+
+
 def _run_foreground(args: argparse.Namespace) -> int:
     if _bind_refused(args):
         return 2
-    middlewares: list = [origin_only_middleware]
+    cors_origins = _parse_cors_origins(args.cors_origins)
+    if cors_origins is None:
+        return 2
+
+    # Outermost first: CORS (preflight + headers) → origin guard → optional auth.
+    middlewares: list = []
+    if cors_origins:
+        middlewares.append(make_cors_middleware(cors_origins))
+    middlewares.append(make_origin_only_middleware(cors_origins))
     if args.token:
         middlewares.append(make_bearer_auth_middleware(args.token))
+
     app = make_app(
         args.comfyui,
         comfyui_base_dir=args.comfyui_base_dir,
@@ -124,6 +163,8 @@ def _run_foreground(args: argparse.Namespace) -> int:
         state_dir=args.state_dir,
         middlewares=middlewares,
     )
+    if cors_origins:
+        attach_cors_prepare(app)
     web.run_app(app, host=args.host, port=args.port)
     return 0
 
@@ -148,6 +189,8 @@ def _server_argv(args: argparse.Namespace) -> list[str]:
         argv += ["--allow-insecure-bind"]
     if args.state_dir:
         argv += ["--state-dir", args.state_dir]
+    for origin in args.cors_origins:
+        argv += ["--enable-cors-header", origin]
     return argv
 
 
@@ -173,6 +216,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_foreground(args)
     if args.command == "start":
         if _bind_refused(args):
+            return 2
+        if _parse_cors_origins(args.cors_origins) is None:
             return 2
         return service.start(_server_argv(args), args.host, args.port)
     if args.command == "stop":

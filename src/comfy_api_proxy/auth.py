@@ -39,6 +39,10 @@ def make_bearer_auth_middleware(token: str) -> Middleware:
             return await handler(request)
         if not request.path.startswith("/api/v2/"):
             return await handler(request)
+        # Browser CORS preflight never carries Authorization; allow OPTIONS
+        # through so an allowlisted origin can negotiate before the real call.
+        if request.method == "OPTIONS":
+            return await handler(request)
         header = request.headers.get("Authorization", "")
         scheme, _, presented = header.partition(" ")
         if scheme.lower() != "bearer" or not presented:
