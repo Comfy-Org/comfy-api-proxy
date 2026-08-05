@@ -149,6 +149,14 @@ class UpstreamUnreachable(Exception):
     instead of letting the raw transport error surface as a bare 500."""
 
 
+def _hash_file(path: Path) -> str:
+    digest = blake3.blake3()
+    with path.open("rb") as f:
+        while chunk := f.read(1 << 16):
+            digest.update(chunk)
+    return "blake3:" + digest.hexdigest()
+
+
 def _valid_job_id(job_id: str) -> bool:
     """Job ids are minted server-side as uuid4 strings (see Proxy.submit). A
     non-UUID id is never legitimate and — worse — would be spliced verbatim
@@ -1303,14 +1311,10 @@ class Proxy:
                 f"Host file exceeds {self.max_upload_bytes} bytes.",
             )
 
-        digest = blake3.blake3()
-        with src.open("rb") as f:
-            while True:
-                chunk = f.read(1 << 16)
-                if not chunk:
-                    break
-                digest.update(chunk)
-        computed_hash = "blake3:" + digest.hexdigest()
+        # Off the event loop: ~0.5s per GiB, and registering model files is the
+        # reason an operator raises --max-upload-mb past the 100 MB default.
+        # Blocking here would stall every open SSE stream for that long.
+        computed_hash = await asyncio.to_thread(_hash_file, src)
         existing = self.assets.get_by_hash(computed_hash)
         base = _external_base(request)
         if existing is not None:

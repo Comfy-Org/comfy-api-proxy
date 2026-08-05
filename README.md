@@ -189,8 +189,10 @@ configuration:
   is refused (the process exits with an error) unless `--token` is set, or
   `--allow-insecure-bind` is passed to explicitly opt out of that guard.
 - **An optional static bearer token** (`--token`) gates all of `/api/v2/*`
-  when configured; unset by default, since a self-hosted single-user
-  ComfyUI usually has nothing to authenticate against.
+  when configured — except `GET /api/v2/health`, which stays unauthenticated
+  so a supervisor can probe liveness without holding the token. Unset by
+  default, since a self-hosted single-user ComfyUI usually has nothing to
+  authenticate against.
 - **A default-on origin-check middleware** — ported from ComfyUI core's own
   `create_origin_only_middleware` — rejects cross-site browser requests even
   when nothing else is configured, closing the DNS-rebinding / drive-by-CSRF
@@ -211,7 +213,7 @@ comfy-api-proxy --comfyui http://127.0.0.1:8188 --port 8189 [options]
 | `--comfyui` | `http://127.0.0.1:8188` | Base URL of the self-hosted ComfyUI to proxy. |
 | `--host` | `127.0.0.1` | Address to bind. Widening past loopback requires `--token` or `--allow-insecure-bind` (see [Security defaults](#security-defaults)). |
 | `--port` | `8189` | Port to serve the v2 API on. |
-| `--token` | *(unset)* | Require `Authorization: Bearer <token>` on every `/api/v2/*` request. |
+| `--token` | *(unset)* | Require `Authorization: Bearer <token>` on every `/api/v2/*` request except `GET /api/v2/health`. |
 | `--comfyui-base-dir` | *(unset)* | Filesystem root of a co-located ComfyUI install. Required to enable direct model-directory placement of model-file uploads; without it, model uploads are rejected (workflow-input uploads still work). |
 | `--max-upload-mb` | `100` | Max single-request upload size, in MB. |
 | `--allow-insecure-bind` | `false` | Permit binding a non-loopback `--host` without a `--token`. Unsafe — exposes an unauthenticated proxy to the network. |
