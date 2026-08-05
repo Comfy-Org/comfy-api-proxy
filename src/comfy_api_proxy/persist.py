@@ -60,6 +60,15 @@ CREATE TABLE IF NOT EXISTS asset_hash_index (
 """
 
 
+def _job_record(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "created_at": datetime.fromisoformat(str(row["created_at"])),
+        "client_id": str(row["client_id"]),
+        "metadata": row["metadata"],
+        "priority": row["priority"],
+    }
+
+
 def _chmod_quietly(target: Path, mode: int) -> None:
     """Best-effort chmod — filesystems without POSIX modes must not be fatal."""
     try:
@@ -145,13 +154,19 @@ class StateStore:
             ).fetchall()
         out: dict[str, dict[str, Any]] = {}
         for row in reversed(rows):  # oldest-first so dict order stays FIFO
-            out[str(row["id"])] = {
-                "created_at": datetime.fromisoformat(str(row["created_at"])),
-                "client_id": str(row["client_id"]),
-                "metadata": row["metadata"],
-                "priority": row["priority"],
-            }
+            out[str(row["id"])] = _job_record(row)
         return out
+
+    def get_job(self, job_id: str) -> dict[str, Any] | None:
+        """One job record by id, or None. The read path for rows older than the
+        ``load_jobs`` startup window, which is much shorter than ComfyUI's
+        history ring (see ``docs/batch-workloads.md``)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT created_at, client_id, metadata, priority FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+        return None if row is None else _job_record(row)
 
     # -- idempotency ---------------------------------------------------------
     def claim_idempotency(self, key: str, *, claimed_at: str, job_id: str | None = None) -> bool:

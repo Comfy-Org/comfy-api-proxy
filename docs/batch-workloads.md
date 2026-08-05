@@ -19,8 +19,19 @@ reload on startup. Each `--state-dir` is local to one proxy↔ComfyUI pair.
 
 The directory is created `0700` and the database `0600`: it stores the HMAC
 secret that signs output asset ids, so any local user who could read it could
-mint valid ids. Only the newest 500 job records are reloaded into memory at
-startup — older rows stay on disk and are still addressable by id.
+mint valid ids.
+
+Only the newest 500 job records are reloaded into memory at startup; older rows
+stay on disk, and `GET /jobs/{id}` reads through to SQLite for them, so their
+`metadata`, `priority`, and `created_at` survive a restart. `GET /jobs` lists
+only the in-memory window. That window is much shorter than ComfyUI's history
+ring (`MAXIMUM_HISTORY_SIZE = 10000`, days at a typical rate), which is why the
+read-through matters: jobs in between still resolve upstream.
+
+**The directory grows without bound.** Every accepted submit stores its full
+workflow graph, which nothing reads back (kept for forensics) and nothing
+prunes — order 10 MB/day per proxy at ~1 000 jobs/day with a large graph. Age
+out the state file on your own schedule if you run one proxy for months.
 
 This is separate from ComfyUI's own SQLite (`--database-url`, used by the
 optional `--enable-assets` catalog of models/files/tags). ComfyUI does not
@@ -53,7 +64,7 @@ Not Cloud OpenAPI parity (`spec/openapi.yaml` is one-way from upstream):
 |---|---|
 | `GET /api/v2/health` | Process probe; does not call ComfyUI; unauthenticated |
 | `GET /api/v2/jobs` | Jobs this proxy recorded. Resolves each candidate against ComfyUI, so the walk stops after 500 records; `truncated: true` means it stopped early rather than running out of matches |
-| `metadata` / `priority` | Opaque ≤1 KiB string; advisory int |
-| `outputs_reused` | `true` when `execution_cached` names at least one node. ComfyUI emits that message on every run, empty when it cached nothing, so presence alone does not mean reuse |
+| `metadata` / `priority` | Opaque ≤1 KiB string; advisory int. Proxy-local — neither is forwarded, so ComfyUI's own `/queue` shows these jobs unlabeled. Point dashboards at `GET /api/v2/jobs` for attribution |
+| `outputs_reused` | `true` when `execution_cached` names at least one node. ComfyUI emits that message on every run, empty when it cached nothing, so presence alone does not mean reuse. A cached job still lists the *original* run's outputs, which may point at bytes that are already gone (`404 output_unavailable`) |
 | `POST /api/v2/assets/from-path` | Register a host file under `--comfyui-base-dir` |
 | `output_unavailable` | Typed 404 when output bytes are gone |

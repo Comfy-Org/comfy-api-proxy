@@ -113,6 +113,8 @@ def test_outputs_reused_false_when_nothing_was_cached(stack):
 
 
 def test_outputs_reused_on_cache_hit(stack):
+    """A fully-cached resubmit still reports the first run's outputs listing —
+    the incident shape: reuse flagged, bytes possibly already gone."""
     _, asset, _ = stack.upload("cat.png", _PNG, "image/png")
     status, job, raw = stack.request(
         "POST",
@@ -123,7 +125,23 @@ def test_outputs_reused_on_cache_hit(stack):
     job = _wait_terminal(stack, job)
     assert job["status"] == "succeeded"
     assert job["outputs_reused"] is True
-    assert job["outputs"] == []
+    assert job["outputs"], "a cached resubmit still lists the original outputs"
+
+
+def test_outputs_reused_on_partial_cache_hit(stack):
+    """Partial caching is ComfyUI's common case: some nodes served from cache,
+    the rest freshly executed. Reuse is still flagged."""
+    _, asset, _ = stack.upload("cat.png", _PNG, "image/png")
+    status, job, raw = stack.request(
+        "POST",
+        "/api/v2/jobs",
+        {"workflow": _simple_workflow(asset["id"], partial_cache_hit=True)},
+    )
+    assert status == 201, raw
+    job = _wait_terminal(stack, job)
+    assert job["status"] == "succeeded"
+    assert job["outputs_reused"] is True
+    assert job["outputs"]
 
 
 def test_from_path_and_output_unavailable(stack_with_models_dir):
@@ -203,6 +221,98 @@ def test_state_dir_survives_proxy_restart(tmp_path, make_stack):
         assert status == 200, raw
         assert job2["metadata"] == "persist-me"
         assert job2["priority"] == 3
+    finally:
+        cleanup2()
+
+
+def test_job_outside_reload_window_reads_through_to_state_dir(tmp_path, make_stack, fake_comfyui):
+    """The by-id read must reach SQLite, not just the reloaded window.
+
+    Startup hydrates only the newest `_MAX_JOB_SCAN` rows (~12h at production
+    rates), while ComfyUI's history ring answers for days. A job in that gap
+    resolves upstream, so it must not come back with its proxy-layer fields
+    dropped and a fabricated `created_at`.
+    """
+    import uuid
+    from datetime import datetime, timedelta, timezone
+
+    from comfy_api_proxy.app import _MAX_JOB_SCAN
+    from comfy_api_proxy.persist import StateStore
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    run_a = tmp_path / "run_a"
+    run_a.mkdir()
+    stack, cleanup = make_stack(run_a, state_dir=str(state_dir), comfyui_port=fake_comfyui)
+    try:
+        _, asset, _ = stack.upload("cat.png", _PNG, "image/png")
+        status, job, raw = stack.request(
+            "POST",
+            "/api/v2/jobs",
+            {
+                "workflow": _simple_workflow(asset["id"]),
+                "metadata": "persist-me",
+                "priority": 3,
+            },
+        )
+        assert status == 201, raw
+        job_id = job["id"]
+        created_at = job["created_at"]
+        assert _wait_terminal(stack, job)["status"] == "succeeded"
+    finally:
+        cleanup()  # proxy only — this fake ComfyUI keeps its history
+
+    # Push the job past the reload window, plus one row ComfyUI never saw so
+    # the gone-upstream half of the same branch is covered too.
+    gone_id = str(uuid.uuid4())
+    store = StateStore(state_dir / "state.sqlite3")
+    try:
+        now = datetime.now(timezone.utc)
+        store.upsert_job(
+            {
+                "id": gone_id,
+                "created_at": now,
+                "client_id": gone_id,
+                "metadata": "also-persist-me",
+                "priority": -5,
+                "workflow": {},
+            }
+        )
+        for i in range(_MAX_JOB_SCAN):
+            store.upsert_job(
+                {
+                    "id": str(uuid.uuid4()),
+                    "created_at": now + timedelta(seconds=i + 1),
+                    "client_id": "filler",
+                    "metadata": None,
+                    "priority": None,
+                    "workflow": {},
+                }
+            )
+    finally:
+        store.close()
+
+    run_b = tmp_path / "run_b"
+    run_b.mkdir()
+    stack2, cleanup2 = make_stack(run_b, state_dir=str(state_dir), comfyui_port=fake_comfyui)
+    try:
+        status, job2, raw = stack2.request("GET", f"/api/v2/jobs/{job_id}")
+        assert status == 200, raw
+        assert job2["status"] == "succeeded", "upstream still has it"
+        assert job2["metadata"] == "persist-me"
+        assert job2["priority"] == 3
+        assert job2["created_at"] == created_at, "created_at must not be refabricated"
+
+        # Known to SQLite, gone from ComfyUI => expired with its fields, not 404.
+        status, job3, raw = stack2.request("GET", f"/api/v2/jobs/{gone_id}")
+        assert status == 200, raw
+        assert job3["status"] == "expired"
+        assert job3["metadata"] == "also-persist-me"
+        assert job3["priority"] == -5
+
+        status, body, _ = stack2.request("GET", f"/api/v2/jobs/{uuid.uuid4()}")
+        assert status == 404
+        assert body["error"]["code"] == "not_found"
     finally:
         cleanup2()
 

@@ -416,8 +416,26 @@ class Proxy:
             "traceback": None,
         }
 
+    def _job_meta(self, job_id: str) -> dict[str, Any]:
+        """Proxy-layer fields for one job: memory first, then --state-dir.
+
+        Only the newest _MAX_JOB_SCAN rows reload into memory, while ComfyUI's
+        history ring keeps a job answerable for days longer. Without the SQLite
+        fallback a job in that gap still returns 200 (upstream resolves it) but
+        loses the metadata/priority/created_at --state-dir exists to preserve.
+        """
+        meta = self._jobs.get(job_id)
+        if meta is not None:
+            return meta
+        if self._store is None:
+            return {}
+        return self._store.get_job(job_id) or {}
+
+    def _knows_job(self, job_id: str) -> bool:
+        return bool(self._job_meta(job_id))
+
     def _job(self, job_id: str, state: dict[str, Any], base: str) -> dict[str, Any]:
-        meta = self._jobs.get(job_id, {})
+        meta = self._job_meta(job_id)
         created = meta.get("created_at", _now())
         status = state["status"]
         if status == "unknown":
@@ -798,7 +816,7 @@ class Proxy:
             state = await self._status_of(job_id, base)
         except UpstreamUnreachable:
             return _error(503, "upstream_unreachable", "Could not reach ComfyUI.")
-        if state["status"] == "unknown" and job_id not in self._jobs:
+        if state["status"] == "unknown" and not self._knows_job(job_id):
             return _error(404, "not_found", f"No job {job_id}.")
         return web.json_response(self._job(job_id, state, base))
 
@@ -807,7 +825,7 @@ class Proxy:
         if not _valid_job_id(job_id):
             return _error(404, "not_found", f"No job {job_id}.")
         base = _external_base(request)
-        if job_id not in self._jobs:
+        if not self._knows_job(job_id):
             # Allow cancel of an id ComfyUI still knows even if the proxy
             # restarted; a wholly unknown id is a 404.
             try:
@@ -841,7 +859,7 @@ class Proxy:
             state = await self._status_of(job_id, base)
         except UpstreamUnreachable:
             return _error(503, "upstream_unreachable", "Could not reach ComfyUI.")
-        if state["status"] == "unknown" and job_id not in self._jobs:
+        if state["status"] == "unknown" and not self._knows_job(job_id):
             return _error(404, "not_found", f"No job {job_id}.")
         if self._open_streams >= _MAX_CONCURRENT_STREAMS:
             resp = _error(
@@ -876,9 +894,9 @@ class Proxy:
         # Connect the WS bridge with the SAME client_id the job was
         # submitted under (see submit()), so ComfyUI's per-client-addressed
         # events actually reach this connection. Fall back to job_id itself
-        # if the proxy has no record of the job (e.g. restarted) — that
-        # matches what submit() would have used anyway.
-        client_id = self._jobs.get(job_id, {}).get("client_id", job_id)
+        # if the proxy has no record of the job at all — that matches what
+        # submit() would have used anyway.
+        client_id = self._job_meta(job_id).get("client_id", job_id)
         bridge = JobEventBridge(
             self.comfyui, job_id, client_id=client_id, snapshot=snapshot, session=self.session
         )
