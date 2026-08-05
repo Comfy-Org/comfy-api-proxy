@@ -35,6 +35,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     workflow   TEXT NOT NULL
 );
 
+-- load_jobs sorts by created_at at every startup, over a table nothing prunes.
+CREATE INDEX IF NOT EXISTS jobs_created_at ON jobs(created_at DESC);
+
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     key        TEXT PRIMARY KEY,
     claimed_at TEXT NOT NULL,
