@@ -7,7 +7,13 @@ hash. These pin the store primitives directly.
 
 from __future__ import annotations
 
-from comfy_api_proxy.assets import AssetStore
+import uuid
+
+from comfy_api_proxy.assets import AssetStore, new_asset_id
+
+
+def test_new_asset_id_is_a_bare_uuid():
+    uuid.UUID(new_asset_id())  # raises if not a valid UUID; no "asset_" prefix
 
 
 def test_lookups_on_empty_store_return_none():

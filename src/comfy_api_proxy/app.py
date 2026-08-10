@@ -259,7 +259,7 @@ class Proxy:
         payload_b64 = base64.urlsafe_b64encode(raw).decode().rstrip("=")
         tag = hmac.new(self._asset_secret, payload_b64.encode(), hashlib.sha256).digest()
         tag_b64 = base64.urlsafe_b64encode(tag).decode().rstrip("=")
-        return f"asset_{payload_b64}.{tag_b64}"
+        return f"{payload_b64}.{tag_b64}"
 
     def _decode_asset_id(self, asset_id: str) -> dict[str, str] | None:
         """Decode + verify a stateless asset id minted by ``_asset_id``.
@@ -267,12 +267,9 @@ class Proxy:
         Returns ``None`` (treated as "unknown/not found" by every caller)
         for anything that isn't a well-formed, correctly-signed id —
         including a syntactically valid but forged one, closing the
-        "any well-formed asset_<...> id is trusted" gap.
+        "any well-formed payload.tag id is trusted" gap.
         """
-        if not asset_id.startswith("asset_"):
-            return None
-        rest = asset_id[len("asset_") :]
-        payload_b64, sep, tag_b64 = rest.partition(".")
+        payload_b64, sep, tag_b64 = asset_id.partition(".")
         if not sep:
             return None
         try:

@@ -69,9 +69,11 @@ def test_job_and_output_urls_are_absolute(stack):
 
 
 def test_upload_asset_returns_asset_shape(stack):
+    import uuid as _uuid
+
     status, asset, raw = stack.upload("cat.png", _PNG, "image/png", tags="input")
     assert status == 201, raw
-    assert asset["id"].startswith("asset_")
+    _uuid.UUID(asset["id"])  # bare UUID, matching the shape other v2 surfaces emit
     assert asset["hash"].startswith("blake3:")
     assert asset["size_bytes"] == len(_PNG)
     assert asset["content_type"] == "image/png"
@@ -585,7 +587,7 @@ def test_normal_paths_still_succeed_after_traversal_fix(stack_with_models_dir):
 # Regression: forgeable stateless output asset ids.
 #
 # Before the fix, `_decode_asset_id` trusted any well-formed
-# `asset_<base64url(json)>` id — a hand-crafted one would let a client fetch
+# `<base64url(json)>.<tag>` id — a hand-crafted one would let a client fetch
 # an arbitrary filename/subfolder via /view (through get_asset_content), or
 # splice an attacker-chosen path into a submitted workflow (through
 # _resolve_asset_ref, reached via a core/ASSET reference). The ids are now
@@ -594,7 +596,7 @@ def test_normal_paths_still_succeed_after_traversal_fix(stack_with_models_dir):
 def test_forged_asset_id_rejected_by_content_fetch(stack):
     raw_payload = json.dumps({"f": "out.png", "s": "", "t": "output"}).encode()
     payload_b64 = base64.urlsafe_b64encode(raw_payload).decode().rstrip("=")
-    forged_id = f"asset_{payload_b64}.notarealsignature"
+    forged_id = f"{payload_b64}.notarealsignature"
 
     status, body, _ = stack.request("GET", f"/api/v2/assets/{forged_id}/content")
     assert status == 404, body
@@ -606,7 +608,7 @@ def test_forged_asset_id_rejected_by_content_fetch(stack):
 def test_forged_asset_id_rejected_by_workflow_resolution(stack):
     raw_payload = json.dumps({"f": "../../etc/passwd", "s": "", "t": "output"}).encode()
     payload_b64 = base64.urlsafe_b64encode(raw_payload).decode().rstrip("=")
-    forged_id = f"asset_{payload_b64}.notarealsignature"
+    forged_id = f"{payload_b64}.notarealsignature"
 
     workflow = {
         "1": {
@@ -633,7 +635,7 @@ def test_legitimately_minted_asset_id_round_trips(stack):
     assert job["status"] == "succeeded", job.get("error")
     assert job["outputs"], "no outputs"
     legit_id = job["outputs"][0]["id"]
-    assert legit_id.startswith("asset_")
+    assert "." in legit_id  # signed `payload.tag` form, unlike bare-UUID upload ids
 
     status, _, content = stack.request("GET", job["outputs"][0]["url"])
     assert status == 200, content
@@ -651,6 +653,21 @@ def test_legitimately_minted_asset_id_round_trips(stack):
     }
     status, body, raw = stack.request("POST", "/api/v2/jobs", {"workflow": workflow2})
     assert status == 201, raw
+
+
+def test_uploaded_asset_id_has_no_dot_and_still_resolves(stack):
+    # Uploaded ids are bare UUIDs (assets.new_asset_id); signed job-output ids
+    # are `<payload_b64>.<tag_b64>`. _decode_asset_id tells the two apart by
+    # whether a "." is present (a bare UUID never contains one, so decoding
+    # falls through to the store lookup) — pin that a bare-UUID id can never
+    # be mistaken for the signed form.
+    status, asset, raw = stack.upload("cat.png", _PNG, "image/png", tags="input")
+    assert status == 201, raw
+    assert "." not in asset["id"]
+
+    status, meta, raw = stack.request("GET", f"/api/v2/assets/{asset['id']}")
+    assert status == 200, raw
+    assert meta["id"] == asset["id"]
 
 
 # ---------------------------------------------------------------------------

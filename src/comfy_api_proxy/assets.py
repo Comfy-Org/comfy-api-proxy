@@ -51,7 +51,7 @@ def _now_iso() -> str:
 
 
 def new_asset_id() -> str:
-    return "asset_" + uuid.uuid4().hex
+    return str(uuid.uuid4())
 
 
 class AssetStore:
