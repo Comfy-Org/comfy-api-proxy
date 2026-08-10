@@ -657,10 +657,9 @@ def test_legitimately_minted_asset_id_round_trips(stack):
 
 def test_uploaded_asset_id_has_no_dot_and_still_resolves(stack):
     # Uploaded ids are bare UUIDs (assets.new_asset_id); signed job-output ids
-    # are `<payload_b64>.<tag_b64>`. _decode_asset_id tells the two apart by
-    # whether a "." is present (a bare UUID never contains one, so decoding
-    # falls through to the store lookup) — pin that a bare-UUID id can never
-    # be mistaken for the signed form.
+    # are `<payload_b64>.<tag_b64>`. Readers hit the store first and only
+    # decode on a miss, so what keeps the two apart is that a bare UUID never
+    # contains a "." and so can never decode as the signed form — pin that.
     status, asset, raw = stack.upload("cat.png", _PNG, "image/png", tags="input")
     assert status == 201, raw
     assert "." not in asset["id"]
