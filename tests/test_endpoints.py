@@ -635,7 +635,9 @@ def test_legitimately_minted_asset_id_round_trips(stack):
     assert job["status"] == "succeeded", job.get("error")
     assert job["outputs"], "no outputs"
     legit_id = job["outputs"][0]["id"]
-    assert "." in legit_id  # signed `payload.tag` form, unlike bare-UUID upload ids
+    # Signed `payload.tag` form, unlike bare-UUID upload ids. Both halves are
+    # base64url, which has no ".", so exactly one separator is the whole shape.
+    assert legit_id.count(".") == 1
 
     status, _, content = stack.request("GET", job["outputs"][0]["url"])
     assert status == 200, content
