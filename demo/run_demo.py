@@ -6,12 +6,15 @@ Usage:
     python demo/run_demo.py --base URL --key KEY   # against any v2 surface
 
 Only --base (and --key for cloud) change between surfaces; nothing else does.
-That is the whole point of the one-contract design.
+That is the whole point of the one-contract design. --base is passed to the
+SDK the way an integrator would set it: as the COMFY_BASE_URL environment
+variable, which is how the client picks a deployment.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -34,7 +37,8 @@ def main() -> int:
     ap.add_argument("--out", default="demo_output.png")
     args = ap.parse_args()
 
-    client = Comfy(args.base, api_key=args.key)
+    os.environ["COMFY_BASE_URL"] = args.base
+    client = Comfy(api_key=args.key)
     print(f"→ running a workflow against {args.base}")
     wf = client.workflows.from_json(WORKFLOW)
     job = client.run(wf)
