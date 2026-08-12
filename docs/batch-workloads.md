@@ -29,9 +29,9 @@ ring (`MAXIMUM_HISTORY_SIZE = 10000`, days at a typical rate), which is why the
 read-through matters: jobs in between still resolve upstream.
 
 **The directory grows without bound.** Every accepted submit stores its full
-workflow graph, which nothing reads back (kept for forensics) and nothing
-prunes — order 10 MB/day per proxy at ~1 000 jobs/day with a large graph. Age
-out the state file on your own schedule if you run one proxy for months.
+workflow graph — read back by `GET /jobs/{id}/workflow`, otherwise unpruned —
+order 10 MB/day per proxy at ~1 000 jobs/day with a large graph. Age out the
+state file on your own schedule if you run one proxy for months.
 
 This is separate from ComfyUI's own SQLite (`--database-url`, used by the
 optional `--enable-assets` catalog of models/files/tags). ComfyUI does not
