@@ -639,18 +639,21 @@ class Proxy:
             return extras_err
 
         # Optional, typed, CLOSED extra_data (mirrors the v2 contract's
-        # `additionalProperties: false`): the only accepted key is
-        # `api_key_comfy_org` — the Comfy API key partner/API nodes authenticate
-        # with. It rides the upstream /prompt body verbatim and is never
-        # persisted or logged. Reject any other shape so the proxy stays
+        # `additionalProperties: false`): accepted keys are `api_key_comfy_org`
+        # (partner/API node auth) and `extra_pnginfo` (opt-in workflow embed
+        # for output PNG metadata). Rides the upstream /prompt body verbatim;
+        # never persisted or logged. Reject any other shape so the proxy stays
         # faithful to the contract instead of forwarding arbitrary data.
         extra_data = body.get("extra_data")
         if extra_data is not None:
-            if not isinstance(extra_data, dict) or set(extra_data) - {"api_key_comfy_org"}:
+            if not isinstance(extra_data, dict) or set(extra_data) - {
+                "api_key_comfy_org",
+                "extra_pnginfo",
+            }:
                 return _error(
                     400,
                     "invalid_request",
-                    "'extra_data' accepts only the 'api_key_comfy_org' field.",
+                    "'extra_data' accepts only 'api_key_comfy_org' and 'extra_pnginfo'.",
                 )
             # The schema types api_key_comfy_org as a (non-nullable) string, so a
             # present-but-null or non-string value is rejected — not forwarded.
@@ -662,6 +665,22 @@ class Proxy:
                     "invalid_request",
                     "'extra_data.api_key_comfy_org' must be a string.",
                 )
+            # extra_pnginfo is itself closed, with a single `workflow` field
+            # that carries the graph verbatim (contents not otherwise checked).
+            if "extra_pnginfo" in extra_data:
+                pnginfo = extra_data["extra_pnginfo"]
+                if not isinstance(pnginfo, dict) or set(pnginfo) - {"workflow"}:
+                    return _error(
+                        400,
+                        "invalid_request",
+                        "'extra_data.extra_pnginfo' accepts only the 'workflow' field.",
+                    )
+                if "workflow" in pnginfo and not isinstance(pnginfo["workflow"], dict):
+                    return _error(
+                        400,
+                        "invalid_request",
+                        "'extra_data.extra_pnginfo.workflow' must be an object.",
+                    )
 
         missing: list[str] = []
         resolved_workflow = self._rewrite_asset_refs(workflow, missing)
@@ -718,11 +737,11 @@ class Proxy:
             "prompt_id": job_id,
             "client_id": job_id,
         }
-        # Forward extra_data (partner-node auth) verbatim to ComfyUI's /prompt.
-        # We never store it on the job row (see self._jobs below), and the
-        # client-facing job response is built field-by-field from an allow-list
-        # (_job), so the credential can't surface through this proxy regardless
-        # of what ComfyUI's /history returns.
+        # Forward extra_data (partner-node auth, workflow embed) verbatim to
+        # ComfyUI's /prompt. We never store it on the job row (see self._jobs
+        # below), and the client-facing job response is built field-by-field
+        # from an allow-list (_job), so it can't surface through this proxy
+        # regardless of what ComfyUI's /history returns.
         if extra_data:
             payload["extra_data"] = extra_data
         try:

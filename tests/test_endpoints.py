@@ -253,6 +253,88 @@ def test_extra_data_rejects_uncontracted_shapes(stack):
         assert body["error"]["code"] == "invalid_request", raw
 
 
+def test_extra_pnginfo_forwarded_to_prompt(stack):
+    # extra_data.extra_pnginfo.workflow (opt-in debug embed) must ride the
+    # upstream /prompt body verbatim, same as api_key_comfy_org.
+    graph = {"1": {"class_type": "SaveImage", "inputs": {}}}
+    status, job, raw = stack.request(
+        "POST",
+        "/api/v2/jobs",
+        {"workflow": {"1": {}}, "extra_data": {"extra_pnginfo": {"workflow": graph}}},
+    )
+    assert status == 201, raw
+    present, value = _fake_prompt_extra_data(stack, job["id"])
+    assert present and value == {"extra_pnginfo": {"workflow": graph}}
+
+
+def test_extra_pnginfo_and_api_key_together_forwarded(stack):
+    # Both accepted keys can be supplied on the same request.
+    graph = {"1": {}}
+    status, job, raw = stack.request(
+        "POST",
+        "/api/v2/jobs",
+        {
+            "workflow": {"1": {}},
+            "extra_data": {
+                "api_key_comfy_org": "comfyui-secret",
+                "extra_pnginfo": {"workflow": graph},
+            },
+        },
+    )
+    assert status == 201, raw
+    present, value = _fake_prompt_extra_data(stack, job["id"])
+    assert present and value == {
+        "api_key_comfy_org": "comfyui-secret",
+        "extra_pnginfo": {"workflow": graph},
+    }
+
+
+def test_extra_pnginfo_workflow_omitted_accepted_and_forwarded(stack):
+    # workflow is optional inside extra_pnginfo (parity with the canonical
+    # contract, where only extra_pnginfo's key set is closed, not required).
+    # An empty extra_pnginfo must still be accepted and forwarded verbatim,
+    # not silently dropped like an empty top-level extra_data.
+    status, job, raw = stack.request(
+        "POST", "/api/v2/jobs", {"workflow": {"1": {}}, "extra_data": {"extra_pnginfo": {}}}
+    )
+    assert status == 201, raw
+    present, value = _fake_prompt_extra_data(stack, job["id"])
+    assert present and value == {"extra_pnginfo": {}}
+
+
+def test_extra_pnginfo_rejects_uncontracted_shapes(stack):
+    # extra_pnginfo is itself closed: only a `workflow` object is accepted.
+    for bad in (
+        {"workflow": {"1": {}}, "surprise": 1},  # unknown key inside extra_pnginfo
+        {"workflow": "not-an-object"},  # workflow must be an object
+        {"workflow": None},  # present-but-null
+        "not-an-object",  # extra_pnginfo itself must be an object
+        None,  # extra_pnginfo itself present-but-null
+    ):
+        status, body, raw = stack.request(
+            "POST",
+            "/api/v2/jobs",
+            {"workflow": {"1": {}}, "extra_data": {"extra_pnginfo": bad}},
+        )
+        assert status == 400, f"{bad!r} -> {raw!r}"
+        assert body["error"]["code"] == "invalid_request", raw
+
+
+def test_extra_data_still_rejects_unknown_top_level_key_with_pnginfo_present(stack):
+    # Adding extra_pnginfo to the accepted set must not loosen the top-level
+    # object into "accept anything" — an undeclared sibling key still 400s.
+    status, body, raw = stack.request(
+        "POST",
+        "/api/v2/jobs",
+        {
+            "workflow": {"1": {}},
+            "extra_data": {"extra_pnginfo": {"workflow": {"1": {}}}, "surprise": 1},
+        },
+    )
+    assert status == 400, raw
+    assert body["error"]["code"] == "invalid_request", raw
+
+
 def test_idempotency_key_reuse_ignores_differing_api_key(stack):
     # api_key_comfy_org is excluded from the idempotency comparison: a resubmit
     # under the same key is rejected as reuse even with a different api_key —
