@@ -26,7 +26,7 @@ class Asset(BaseModel):
     A user-owned record identified by a server-assigned UUID, backing an immutable blob whose content carries a server-computed blake3 hash. `hash` may be computed lazily: an asset record (and its retrievable bytes) can exist before its hash is filled in.
     """
 
-    id: str = Field(..., examples=['asset_01JZV8Q3M7K2W9X0Y1Z2A3B4C5'])
+    id: str = Field(..., examples=['9f8a1c0d-2b3e-4f56-8a7b-1c2d3e4f5a6b'])
     hash: str = Field(
         ...,
         description='`blake3:<hex>`; null while lazily computed.',
@@ -179,7 +179,7 @@ class FieldType(Enum):
 
 
 class Info(BaseModel):
-    id: str = Field(..., examples=['asset_01JZV8Q3M7K2W9X0Y1Z2A3B4C5'])
+    id: str = Field(..., examples=['9f8a1c0d-2b3e-4f56-8a7b-1c2d3e4f5a6b'])
     hash: str | None = Field(None, examples=['blake3:9f8a1c0d...'])
     file_path: str | None = Field(None, examples=['photo.png'])
 
@@ -191,7 +191,7 @@ class AssetReference(BaseModel):
     request/response body itself):
 
         {"__type": "core/ASSET",
-         "info": {"id": "asset_...", "hash": "blake3:...",
+         "info": {"id": "<asset-uuid>", "hash": "blake3:...",
                   "file_path": "photo.png"}}
 
     `info.id` (the asset UUID) is required in v1 and authoritative;
@@ -216,7 +216,7 @@ class Output(BaseModel):
     type: OutputType
     content_type: str = Field(..., examples=['image/png'])
     size_bytes: int = Field(..., examples=[1848320])
-    id: str = Field(..., description='Asset UUID.', examples=['asset_01JZV9R4N8...'])
+    id: str = Field(..., description='Asset UUID.', examples=['9f8a1c0d-2b3e-4f56-...'])
     hash: str = Field(..., description='`blake3:<hex>`; null until lazily computed.')
     url: AnyUrl
     url_expires_at: AwareDatetime

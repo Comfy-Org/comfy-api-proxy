@@ -28,12 +28,20 @@ def _forbidden(code: str, message: str) -> web.Response:
 
 def make_bearer_auth_middleware(token: str) -> Middleware:
     """Build a middleware requiring ``Authorization: Bearer <token>`` on
-    every ``/api/v2/*`` request, constant-time compared against ``token``.
+    every ``/api/v2/*`` request (except ``GET /api/v2/health``), constant-time
+    compared against ``token``.
     """
 
     @web.middleware
     async def bearer_auth_middleware(request: web.Request, handler: Handler) -> web.StreamResponse:
+        # Health is unauthenticated so schedulers can probe without a credential.
+        if request.path == "/api/v2/health":
+            return await handler(request)
         if not request.path.startswith("/api/v2/"):
+            return await handler(request)
+        # Browser CORS preflight never carries Authorization; allow OPTIONS
+        # through so an allowlisted origin can negotiate before the real call.
+        if request.method == "OPTIONS":
             return await handler(request)
         header = request.headers.get("Authorization", "")
         scheme, _, presented = header.partition(" ")

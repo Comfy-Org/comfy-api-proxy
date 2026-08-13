@@ -63,6 +63,32 @@ async def test_non_v2_path_bypasses_the_gate():
     assert ran
 
 
+async def test_options_preflight_bypasses_the_gate():
+    """CORS preflight never carries Authorization; the gate must not 401 it.
+
+    Uses a guarded job path, not /api/v2/health — health has its own
+    unauthenticated carve-out, which would mask what this asserts.
+    """
+    resp, ran = await _invoke(make_bearer_auth_middleware("secret"), {})
+    # GET without token still rejects — control for the OPTIONS case below.
+    assert resp.status == 401
+    assert not ran
+
+    called = {"v": False}
+
+    async def handler(_req):
+        called["v"] = True
+        return web.Response(status=204)
+
+    mw = make_bearer_auth_middleware("secret")
+    resp = await mw(
+        make_mocked_request("OPTIONS", "/api/v2/jobs/x", headers={}),
+        handler,
+    )
+    assert resp.status == 204
+    assert called["v"]
+
+
 def test_token_gate_enforced_end_to_end(stack_with_token):
     jid = "11111111-1111-1111-1111-111111111111"
     unauth, body, _ = stack_with_token.request("GET", f"/api/v2/jobs/{jid}")

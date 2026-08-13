@@ -69,9 +69,11 @@ def test_job_and_output_urls_are_absolute(stack):
 
 
 def test_upload_asset_returns_asset_shape(stack):
+    import uuid as _uuid
+
     status, asset, raw = stack.upload("cat.png", _PNG, "image/png", tags="input")
     assert status == 201, raw
-    assert asset["id"].startswith("asset_")
+    _uuid.UUID(asset["id"])  # bare UUID, matching the shape other v2 surfaces emit
     assert asset["hash"].startswith("blake3:")
     assert asset["size_bytes"] == len(_PNG)
     assert asset["content_type"] == "image/png"
@@ -296,6 +298,119 @@ def test_get_unknown_job_404(stack):
     status, body, _ = stack.request("GET", "/api/v2/jobs/job_ghost")
     assert status == 404
     assert body["error"]["code"] == "not_found"
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v2/jobs/{id}/workflow
+# ---------------------------------------------------------------------------
+def test_get_job_workflow_round_trip_no_asset_refs(stack):
+    # No core/ASSET refs to resolve, so the executed graph happens to equal
+    # the submitted one here — this only proves the basic round trip + the
+    # `format` discriminator; test_get_job_workflow_returns_resolved_graph
+    # below proves it's actually the EXECUTED graph, not the submitted one.
+    workflow = {"9": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}}}
+    status, job, raw = stack.request("POST", "/api/v2/jobs", {"workflow": workflow})
+    assert status == 201, raw
+    status, body, raw = stack.request("GET", f"/api/v2/jobs/{job['id']}/workflow")
+    assert status == 200, raw
+    assert body == {"workflow": workflow, "format": "api"}
+
+
+def test_get_job_workflow_returns_resolved_graph_not_submitted(stack):
+    # The endpoint must return the EXECUTED graph (core/ASSET refs already
+    # resolved to the filename ComfyUI received), not the as-submitted one —
+    # matching what actually ran, per the contract's parity requirement.
+    _, asset, _ = stack.upload("cat.png", _PNG, "image/png", tags="input")
+    submitted = {
+        "1": {
+            "class_type": "LoadImage",
+            "inputs": {"image": {"__type": "core/ASSET", "info": {"id": asset["id"]}}},
+        },
+        "9": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}},
+    }
+    status, job, raw = stack.request("POST", "/api/v2/jobs", {"workflow": submitted})
+    assert status == 201, raw
+
+    status, body, raw = stack.request("GET", f"/api/v2/jobs/{job['id']}/workflow")
+    assert status == 200, raw
+    assert body["format"] == "api"
+    returned = body["workflow"]
+    assert returned != submitted, "returned the as-submitted graph, not the executed one"
+    # The core/ASSET reference object is gone, replaced by the plain filename
+    # string ComfyUI actually received.
+    assert isinstance(returned["1"]["inputs"]["image"], str)
+    assert returned["9"] == submitted["9"]  # untouched node is unchanged
+
+
+def test_get_job_workflow_unknown_job_404(stack):
+    status, body, _ = stack.request("GET", "/api/v2/jobs/job_ghost/workflow")
+    assert status == 404
+    assert body["error"]["code"] == "not_found"
+
+
+def test_get_job_workflow_rejects_non_uuid_id(stack):
+    status, body, _ = stack.request("GET", "/api/v2/jobs/..%2F..%2Ffree/workflow")
+    assert status == 404, body
+    assert body["error"]["code"] == "not_found"
+
+
+def test_get_job_workflow_never_includes_extra_data(stack):
+    # extra_data (partner API key) must never surface through this endpoint,
+    # even though it rode the upstream /prompt call for this same job.
+    status, job, raw = stack.request(
+        "POST",
+        "/api/v2/jobs",
+        {"workflow": {"1": {}}, "extra_data": {"api_key_comfy_org": "comfyui-secret"}},
+    )
+    assert status == 201, raw
+    status, body, raw = stack.request("GET", f"/api/v2/jobs/{job['id']}/workflow")
+    assert status == 200, raw
+    assert body == {"workflow": {"1": {}}, "format": "api"}
+    assert "extra_data" not in body
+    assert "comfyui-secret" not in json.dumps(body)
+
+
+def test_get_job_workflow_survives_restart_via_state_dir(make_stack, tmp_path):
+    # A job the in-memory window has forgotten (proxy restarted) must still
+    # resolve through --state-dir, mirroring get_job()'s own read-through.
+    state_dir = tmp_path / "state"
+    stack, cleanup = make_stack(tmp_path, state_dir=str(state_dir))
+    try:
+        workflow = {"9": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}}}
+        status, job, raw = stack.request("POST", "/api/v2/jobs", {"workflow": workflow})
+        assert status == 201, raw
+    finally:
+        cleanup()
+
+    stack2, cleanup2 = make_stack(tmp_path, state_dir=str(state_dir))
+    try:
+        status, body, raw = stack2.request("GET", f"/api/v2/jobs/{job['id']}/workflow")
+        assert status == 200, raw
+        assert body == {"workflow": workflow, "format": "api"}
+    finally:
+        cleanup2()
+
+
+def test_get_job_workflow_404_without_state_dir_after_restart(make_stack, tmp_path):
+    # Without --state-dir, a restart drops the in-memory record entirely — the
+    # endpoint must say so (404), not fabricate an answer from ComfyUI's
+    # resolved history (which wouldn't equal what was submitted anyway).
+    stack, cleanup = make_stack(tmp_path)
+    try:
+        workflow = {"9": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}}}
+        status, job, raw = stack.request("POST", "/api/v2/jobs", {"workflow": workflow})
+        assert status == 201, raw
+        comfyui_port = stack.comfyui_port
+    finally:
+        cleanup()
+
+    stack2, cleanup2 = make_stack(tmp_path, comfyui_port=comfyui_port)
+    try:
+        status, body, raw = stack2.request("GET", f"/api/v2/jobs/{job['id']}/workflow")
+        assert status == 404, raw
+        assert body["error"]["code"] == "not_found"
+    finally:
+        cleanup2()
 
 
 def test_sse_stream_delivers_progress_preview_and_terminal(stack):
@@ -585,7 +700,7 @@ def test_normal_paths_still_succeed_after_traversal_fix(stack_with_models_dir):
 # Regression: forgeable stateless output asset ids.
 #
 # Before the fix, `_decode_asset_id` trusted any well-formed
-# `asset_<base64url(json)>` id — a hand-crafted one would let a client fetch
+# `<base64url(json)>.<tag>` id — a hand-crafted one would let a client fetch
 # an arbitrary filename/subfolder via /view (through get_asset_content), or
 # splice an attacker-chosen path into a submitted workflow (through
 # _resolve_asset_ref, reached via a core/ASSET reference). The ids are now
@@ -594,7 +709,7 @@ def test_normal_paths_still_succeed_after_traversal_fix(stack_with_models_dir):
 def test_forged_asset_id_rejected_by_content_fetch(stack):
     raw_payload = json.dumps({"f": "out.png", "s": "", "t": "output"}).encode()
     payload_b64 = base64.urlsafe_b64encode(raw_payload).decode().rstrip("=")
-    forged_id = f"asset_{payload_b64}.notarealsignature"
+    forged_id = f"{payload_b64}.notarealsignature"
 
     status, body, _ = stack.request("GET", f"/api/v2/assets/{forged_id}/content")
     assert status == 404, body
@@ -606,7 +721,7 @@ def test_forged_asset_id_rejected_by_content_fetch(stack):
 def test_forged_asset_id_rejected_by_workflow_resolution(stack):
     raw_payload = json.dumps({"f": "../../etc/passwd", "s": "", "t": "output"}).encode()
     payload_b64 = base64.urlsafe_b64encode(raw_payload).decode().rstrip("=")
-    forged_id = f"asset_{payload_b64}.notarealsignature"
+    forged_id = f"{payload_b64}.notarealsignature"
 
     workflow = {
         "1": {
@@ -633,7 +748,12 @@ def test_legitimately_minted_asset_id_round_trips(stack):
     assert job["status"] == "succeeded", job.get("error")
     assert job["outputs"], "no outputs"
     legit_id = job["outputs"][0]["id"]
-    assert legit_id.startswith("asset_")
+    # Signed `payload.tag` form, unlike bare-UUID upload ids. Both halves are
+    # base64url, which has no ".", so exactly one separator is the whole shape —
+    # and the prefix carries no "." either, so the count alone would still admit
+    # the retired `asset_payload.tag`. Both assertions are load-bearing.
+    assert not legit_id.startswith("asset_")
+    assert legit_id.count(".") == 1
 
     status, _, content = stack.request("GET", job["outputs"][0]["url"])
     assert status == 200, content
@@ -651,6 +771,51 @@ def test_legitimately_minted_asset_id_round_trips(stack):
     }
     status, body, raw = stack.request("POST", "/api/v2/jobs", {"workflow": workflow2})
     assert status == 201, raw
+
+
+def test_uploaded_asset_id_has_no_dot_and_still_resolves(stack):
+    # Uploaded ids are bare UUIDs (assets.new_asset_id); signed job-output ids
+    # are `<payload_b64>.<tag_b64>`. Readers hit the store first and only
+    # decode on a miss, so what keeps the two apart is that a bare UUID never
+    # contains a "." and so can never decode as the signed form — pin that.
+    status, asset, raw = stack.upload("cat.png", _PNG, "image/png", tags="input")
+    assert status == 201, raw
+    assert "." not in asset["id"]
+
+    status, meta, raw = stack.request("GET", f"/api/v2/assets/{asset['id']}")
+    assert status == 200, raw
+    assert meta["id"] == asset["id"]
+
+
+async def test_legacy_asset_id_without_job_scoping_omits_job_id():
+    # An id minted before the per-job-scoping change has no "j" in its signed
+    # payload (see _decode_asset_id) — get_asset() must not fabricate a
+    # job_id for those. Every other test mints ids the normal way (always
+    # job-scoped), so this is the only coverage that would catch a regression
+    # that emits job_id unconditionally. Signed by hand with the running
+    # Proxy's own secret (proxy._asset_id always includes "j" now), mirroring
+    # the forged-id tests above but with a genuine signature.
+    import base64
+    import hashlib
+    import hmac
+    import json
+
+    from aiohttp.test_utils import make_mocked_request
+
+    from comfy_api_proxy.app import Proxy
+
+    proxy = Proxy("http://127.0.0.1:1")  # never contacted: get_asset needs no upstream call
+    raw_payload = json.dumps({"f": "out.png", "s": "", "t": "output"}).encode()
+    payload_b64 = base64.urlsafe_b64encode(raw_payload).decode().rstrip("=")
+    tag = hmac.new(proxy._asset_secret, payload_b64.encode(), hashlib.sha256).digest()
+    tag_b64 = base64.urlsafe_b64encode(tag).decode().rstrip("=")
+    legacy_id = f"{payload_b64}.{tag_b64}"
+
+    req = make_mocked_request("GET", f"/api/v2/assets/{legacy_id}", match_info={"id": legacy_id})
+    resp = await proxy.get_asset(req)
+    assert resp.status == 200
+    asset = json.loads(resp.body)
+    assert "job_id" not in asset, asset
 
 
 # ---------------------------------------------------------------------------
@@ -985,7 +1150,11 @@ async def test_asset_content_upstream_5xx_maps_to_502_but_404_stays_404():
         async def get(self, url, params=None, headers=None):  # noqa: ANN001
             return _Resp(self._status)
 
-    cases = [(500, 502, "upstream_error"), (403, 502, "upstream_error"), (404, 404, "not_found")]
+    cases = [
+        (500, 502, "upstream_error"),
+        (403, 502, "upstream_error"),
+        (404, 404, "output_unavailable"),
+    ]
     for upstream_status, expected_status, expected_code in cases:
         proxy = Proxy("http://comfy")
         proxy._session = _Session(upstream_status)  # type: ignore[assignment]

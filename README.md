@@ -94,12 +94,15 @@ Wraps ComfyUI's native HTTP + WebSocket API one-to-one:
 | v2 operation | Backed by |
 |---|---|
 | `POST /api/v2/jobs` | Resolves any `core/ASSET` reference in the workflow to the filename ComfyUI expects, then `POST /prompt` |
+| `GET /api/v2/jobs` | Lists jobs this proxy recorded (optional `status` / `limit`), newest first, with `truncated` when the scan stopped early; proxy-local |
 | `GET /api/v2/jobs/{id}` | `GET /history/{id}` (+ `/queue` while queued/running) — the authoritative, pollable state |
 | `POST /api/v2/jobs/{id}/cancel` | ComfyUI's atomic `POST /api/jobs/{id}/cancel` |
 | `GET /api/v2/jobs/{id}/events` | Server-Sent Events, driven by ComfyUI's `/ws` (the only live signal ComfyUI exposes) |
 | `POST /api/v2/assets` | Multipart upload; blake3-hashed and deduped locally; routed to ComfyUI's `/upload/image` for workflow inputs, or placed directly in a model directory (see below) for model weights |
 | `POST /api/v2/assets/from-hash`, `HEAD /api/v2/assets/by-hash/{hash}` | Local hash index |
-| `GET /api/v2/assets/{id}`, `GET /api/v2/assets/{id}/content` | Local index / ComfyUI `/view`, Range-capable |
+| `POST /api/v2/assets/from-path` | Zero-copy register of a file already under `--comfyui-base-dir` |
+| `GET /api/v2/assets/{id}`, `GET /api/v2/assets/{id}/content` | Local index / ComfyUI `/view`, Range-capable; missing bytes → `404 output_unavailable` |
+| `GET /api/v2/health` | Cheap process probe (does not call ComfyUI) |
 
 **Poll-first, same as the canonical contract:** `GET /api/v2/jobs/{id}` is
 always the source of truth for a job's state; the SSE stream
@@ -186,12 +189,16 @@ configuration:
   is refused (the process exits with an error) unless `--token` is set, or
   `--allow-insecure-bind` is passed to explicitly opt out of that guard.
 - **An optional static bearer token** (`--token`) gates all of `/api/v2/*`
-  when configured; unset by default, since a self-hosted single-user
-  ComfyUI usually has nothing to authenticate against.
+  when configured — except `GET /api/v2/health`, which stays unauthenticated
+  so a supervisor can probe liveness without holding the token. Unset by
+  default, since a self-hosted single-user ComfyUI usually has nothing to
+  authenticate against.
 - **A default-on origin-check middleware** — ported from ComfyUI core's own
   `create_origin_only_middleware` — rejects cross-site browser requests even
   when nothing else is configured, closing the DNS-rebinding / drive-by-CSRF
-  hole any unauthenticated localhost server is exposed to.
+  hole any unauthenticated localhost server is exposed to. Opt in a hosted
+  web app with `--enable-cors-header <origin>` (repeatable; `*` refused) —
+  see [Browser access](docs/browser-access.md).
 - **Model-file uploads are safetensors-only, with path-traversal and
   symlink-escape guards** (see *Model-file uploads* above) — and are
   rejected outright unless the proxy was started co-located with
@@ -208,10 +215,24 @@ comfy-api-proxy --comfyui http://127.0.0.1:8188 --port 8189 [options]
 | `--comfyui` | `http://127.0.0.1:8188` | Base URL of the self-hosted ComfyUI to proxy. |
 | `--host` | `127.0.0.1` | Address to bind. Widening past loopback requires `--token` or `--allow-insecure-bind` (see [Security defaults](#security-defaults)). |
 | `--port` | `8189` | Port to serve the v2 API on. |
-| `--token` | *(unset)* | Require `Authorization: Bearer <token>` on every `/api/v2/*` request. |
+| `--token` | *(unset)* | Require `Authorization: Bearer <token>` on every `/api/v2/*` request except `GET /api/v2/health`. |
 | `--comfyui-base-dir` | *(unset)* | Filesystem root of a co-located ComfyUI install. Required to enable direct model-directory placement of model-file uploads; without it, model uploads are rejected (workflow-input uploads still work). |
 | `--max-upload-mb` | `100` | Max single-request upload size, in MB. |
 | `--allow-insecure-bind` | `false` | Permit binding a non-loopback `--host` without a `--token`. Unsafe — exposes an unauthenticated proxy to the network. |
+| `--state-dir` | *(unset)* | Opt-in proxy-layer SQLite for job records, idempotency keys, the asset index, and the output-id signing secret (separate from ComfyUI's asset catalog). See [docs/batch-workloads.md](docs/batch-workloads.md). |
+| `--enable-cors-header` | *(unset)* | Allow a browser `Origin` to call this proxy (repeatable). Explicit origins only — `*` is refused. See [Browser access](docs/browser-access.md). |
+
+## Browser access (hosted origin → local proxy)
+
+```bash
+comfy-api-proxy --enable-cors-header https://your-app.example --token "$LOCAL_PROXY_TOKEN"
+```
+
+Enables CORS preflight, `Authorization` / `Idempotency-Key`, exposes
+`Retry-After` / range headers, and makes `GET /api/v2/health` readable from
+the allowlisted Origin. `@comfyorg/sdk` stays Node-only for v1 — browser apps
+should use `fetch` against `/api/v2/*`. Details:
+[docs/browser-access.md](docs/browser-access.md).
 
 ## SDKs and the API contract
 
@@ -270,20 +291,25 @@ a regeneration gets caught immediately instead of drifting silently. See
 ## Scope
 
 Implemented: submit (with `core/ASSET` resolution), poll, cancel, live SSE
-events, asset upload/download, from-hash/by-hash dedup, and guarded
-model-directory placement.
+events, asset upload/download, from-hash/by-hash dedup, guarded
+model-directory placement, optional `--state-dir` persistence, caller
+`metadata` / advisory `priority`, `GET /jobs`, `outputs_reused`,
+`POST /assets/from-path`, and `GET /health`.
+
+Batch topology, durability, priority, and cancel:
+[docs/batch-workloads.md](docs/batch-workloads.md).
 
 Known limitations:
 
-- **State is in-memory only.** The asset index and job store live in memory (as
-  does ComfyUI's own history), so all state is lost on restart. A job id or asset
-  id issued before a restart no longer resolves afterward — this includes the
-  HMAC-signed stateless output ids, since the signing secret is regenerated per
-  process. A client that persists an id across a proxy restart must expect a 404;
-  a durable store is a follow-up.
-- **`Idempotency-Key` dedup is in-memory.** A reused key is rejected
-  (`422 idempotency_key_reuse` — keys are single-use, no replay), but the claim
-  set lives in the process and is cleared on restart, so a key reused across a
-  proxy restart is not detected. A durable store is a follow-up.
-- **Uploads are not zero-copy.** Large uploads are read fully into memory / a
-  temp file rather than true streaming.
+- **`--state-dir` is opt-in.** Proxy records (jobs, idempotency, asset index,
+  signing secret) survive restarts. This is not ComfyUI's asset-catalog
+  SQLite (`--database-url` / `--enable-assets`); history and output files
+  remain ComfyUI's responsibility (`404 output_unavailable` when bytes are
+  gone).
+- **One proxy ↔ one ComfyUI.** Multi-backend routing is out of scope.
+- **`priority` is advisory only** — never mapped to ComfyUI `front: true`.
+- **Proxy-local extensions** are not yet in the synced Cloud OpenAPI
+  (`spec/openapi.yaml` is one-way from upstream; not hand-edited here).
+- **Uploads still buffer**; `from-path` avoids the copy when the file already
+  lives under `--comfyui-base-dir`.
+

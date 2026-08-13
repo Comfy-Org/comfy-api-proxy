@@ -16,6 +16,9 @@ State machine (deliberately tiny but realistic):
     running then succeeded.
   * A workflow whose graph contains an input ``{"hang": true}`` never
     auto-completes, so cancellation has a deterministic in-flight target.
+  * ``{"cache_hit": true}`` / ``{"partial_cache_hit": true}`` control which
+    nodes ``execution_cached`` names; outputs are listed either way, as a real
+    backend does (see ``_history_entry``).
   * ``/ws`` drives one connecting client: it performs the handshake, emits a
     ``progress`` text frame and a binary preview frame, then waits for the
     job to reach a terminal state (via the timer or a cancel) and emits the
@@ -92,6 +95,24 @@ async def prompt(request: web.Request) -> web.Response:
         and node["inputs"].get("hang") is True
         for node in graph.values()
     )
+
+    def _flagged(name: str) -> bool:
+        return any(
+            isinstance(node, dict)
+            and isinstance(node.get("inputs"), dict)
+            and node["inputs"].get(name) is True
+            for node in graph.values()
+        )
+
+    # `cache_hit` = every node served from cache; `partial_cache_hit` = the
+    # common real case, some nodes cached and the rest freshly executed.
+    node_ids = list(graph.keys())
+    if _flagged("cache_hit"):
+        cached_nodes = node_ids
+    elif _flagged("partial_cache_hit"):
+        cached_nodes = node_ids[:1]
+    else:
+        cached_nodes = []
     # A workflow may set `complete_after_seconds` on any node to control how
     # long the fake stays running — lets a test connect its SSE stream before
     # the job completes without racing the default 0.2s timer.
@@ -105,6 +126,7 @@ async def prompt(request: web.Request) -> web.Response:
         "state": "running",
         "outputs": _default_outputs(),
         "hang": hang,
+        "cached_nodes": cached_nodes,
         "client_id": client_id,
         # Record what the proxy forwarded so a test can prove extra_data
         # (partner-node auth) rode the /prompt body verbatim. `present` captures
@@ -130,8 +152,21 @@ def _history_entry(job: dict) -> dict:
             },
         }
     return {
+        # A cached resubmit keeps the ORIGINAL outputs listing — real ComfyUI
+        # does not re-run SaveImage but still reports the file the first run
+        # wrote (measured on a live backend, GitHub #21). Emptying it here
+        # would hide the case integrators actually hit: a reused listing
+        # pointing at bytes that may already be gone (404 output_unavailable).
         "outputs": job["outputs"],
-        "status": {"status_str": "success", "completed": True, "messages": []},
+        "status": {
+            "status_str": "success",
+            "completed": True,
+            # Real ComfyUI emits execution_cached on every run, with an empty
+            # node list when nothing was cached. Reproduce that, or consumers
+            # that key off the message's mere presence look correct here and
+            # misreport against a real server.
+            "messages": [["execution_cached", {"nodes": job["cached_nodes"]}]],
+        },
     }
 
 

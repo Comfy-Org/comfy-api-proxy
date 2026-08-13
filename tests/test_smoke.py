@@ -161,8 +161,25 @@ def test_submit_poll_download_roundtrip(servers):
     assert job["status"] == "succeeded", f"job did not succeed: {job.get('error')}"
     assert job["outputs"], "job succeeded but produced no outputs"
 
-    # 3. Download the output content and assert it is a real, non-empty PNG.
+    # 3. The output identifies the job that produced it (callers correlate
+    # per output file, not per job, so this is the load-bearing assertion).
     output = job["outputs"][0]
+    assert output["job_id"] == job_id, output
+
+    # 4. Fetching the same output standalone (by its asset id, not nested in
+    # the job response) still carries job_id.
+    status, asset, raw = _request("GET", f"{PROXY_BASE}/api/v2/assets/{output['id']}")
+    assert status == 200, f"get_asset failed ({status}): {raw!r}"
+    assert asset["job_id"] == job_id, asset
+
+    # 5. Fetch the job's workflow: the executed graph (WORKFLOW has no
+    #    core/ASSET refs to resolve, so it equals what was submitted here),
+    #    tagged with the "api" format discriminator.
+    status, body, raw = _request("GET", f"{PROXY_BASE}/api/v2/jobs/{job_id}/workflow")
+    assert status == 200, f"get_job_workflow failed ({status}): {raw!r}"
+    assert body == {"workflow": WORKFLOW, "format": "api"}
+
+    # 6. Download the output content and assert it is a real, non-empty PNG.
     status, _parsed, content = _request("GET", output["url"])
     assert status == 200, f"download failed ({status})"
     assert content, "downloaded output is empty"

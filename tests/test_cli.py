@@ -20,3 +20,48 @@ def test_main_refuses_empty_host_without_token(capsys):
     rc = main(["--host", "", "--port", "0", "--comfyui", "http://127.0.0.1:8188"])
     assert rc == 2
     assert "refusing to bind" in capsys.readouterr().err
+
+
+def test_main_refuses_wildcard_cors_origin(capsys):
+    rc = main(
+        [
+            "--port",
+            "0",
+            "--comfyui",
+            "http://127.0.0.1:8188",
+            "--enable-cors-header",
+            "*",
+        ]
+    )
+    assert rc == 2
+    assert "invalid --enable-cors-header" in capsys.readouterr().err
+
+
+def test_main_refuses_cors_origin_with_path(capsys):
+    rc = main(
+        [
+            "--port",
+            "0",
+            "--comfyui",
+            "http://127.0.0.1:8188",
+            "--enable-cors-header",
+            "https://app.example.com/path",
+        ]
+    )
+    assert rc == 2
+    assert "invalid --enable-cors-header" in capsys.readouterr().err
+
+
+def test_main_refuses_cors_origin_with_invalid_port(capsys):
+    rc = main(
+        [
+            "--port",
+            "0",
+            "--comfyui",
+            "http://127.0.0.1:8188",
+            "--enable-cors-header",
+            "https://app.example.com:bad",
+        ]
+    )
+    assert rc == 2
+    assert "invalid --enable-cors-header" in capsys.readouterr().err

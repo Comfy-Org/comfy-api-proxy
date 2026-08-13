@@ -64,6 +64,20 @@ class Stack:
         *,
         headers: dict[str, str] | None = None,
     ) -> tuple[int, Any, bytes]:
+        status, parsed, raw, _resp_headers = self.request_with_headers(
+            method, path, body, headers=headers
+        )
+        return status, parsed, raw
+
+    def request_with_headers(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, Any, bytes, dict[str, str]]:
+        """Like :meth:`request`, but also returns response headers (lower-cased keys)."""
         url = self.base + path if path.startswith("/") else path
         data = json.dumps(body).encode() if body is not None else None
         hdrs = dict(headers or {})
@@ -75,14 +89,14 @@ class Stack:
                 raw = r.read()
                 ctype = r.headers.get("Content-Type", "")
                 parsed = json.loads(raw) if "application/json" in ctype else None
-                return r.status, parsed, raw
+                return r.status, parsed, raw, {k.lower(): v for k, v in r.headers.items()}
         except urllib.error.HTTPError as e:
             raw = e.read()
             try:
                 parsed = json.loads(raw)
             except Exception:
                 parsed = None
-            return e.code, parsed, raw
+            return e.code, parsed, raw, {k.lower(): v for k, v in e.headers.items()}
 
     def upload(
         self, file_path: str, content: bytes, content_type: str, **fields: str
@@ -160,10 +174,17 @@ def _make_stack(
     comfyui_base_dir: str | None = None,
     token: str | None = None,
     max_upload_mb: int | None = None,
+    state_dir: str | None = None,
+    comfyui_port: int | None = None,
+    cors_origins: list[str] | None = None,
 ):
-    """Spawn fake ComfyUI + the real proxy on free ports; yield a Stack driver."""
+    """Spawn fake ComfyUI + the real proxy on free ports; yield a Stack driver.
+
+    Pass ``comfyui_port`` to reuse an already-running fake (the ``fake_comfyui``
+    fixture) so a test can restart the proxy alone, leaving upstream history
+    intact — the state a proxy restart in production actually meets.
+    """
     procs: list[tuple[subprocess.Popen, str, Path]] = []
-    comfyui_port = _free_port()
     proxy_port = _free_port()
 
     def _spawn(args: list[str], port: int, label: str) -> None:
@@ -173,16 +194,18 @@ def _make_stack(
         procs.append((proc, label, log_path))
         _wait_for_port(port, proc, label, log_path)
 
-    _spawn(
-        [
-            sys.executable,
-            str(REPO_ROOT / "demo" / "fake_comfyui.py"),
-            "--port",
-            str(comfyui_port),
-        ],
-        comfyui_port,
-        "fake_comfyui",
-    )
+    if comfyui_port is None:
+        comfyui_port = _free_port()
+        _spawn(
+            [
+                sys.executable,
+                str(REPO_ROOT / "demo" / "fake_comfyui.py"),
+                "--port",
+                str(comfyui_port),
+            ],
+            comfyui_port,
+            "fake_comfyui",
+        )
     proxy_args = [
         sys.executable,
         "-m",
@@ -198,6 +221,10 @@ def _make_stack(
         proxy_args += ["--token", token]
     if max_upload_mb is not None:
         proxy_args += ["--max-upload-mb", str(max_upload_mb)]
+    if state_dir is not None:
+        proxy_args += ["--state-dir", state_dir]
+    for origin in cors_origins or []:
+        proxy_args += ["--enable-cors-header", origin]
     _spawn(proxy_args, proxy_port, "proxy")
 
     stack = Stack(f"http://127.0.0.1:{proxy_port}", comfyui_port, proxy_port)
@@ -213,6 +240,37 @@ def _make_stack(
                 proc.wait(timeout=5)
 
     return stack, _cleanup
+
+
+@pytest.fixture
+def make_stack():
+    """Factory for Stack drivers with custom kwargs (e.g. state_dir restarts)."""
+    return _make_stack
+
+
+@pytest.fixture
+def fake_comfyui(tmp_path) -> Any:
+    """A fake ComfyUI whose lifetime is independent of any proxy; yields its
+    port for `make_stack(..., comfyui_port=...)`."""
+    port = _free_port()
+    log_path = tmp_path / "fake_comfyui_shared.log"
+    with log_path.open("w") as log_file:
+        proc = subprocess.Popen(
+            [sys.executable, str(REPO_ROOT / "demo" / "fake_comfyui.py"), "--port", str(port)],
+            cwd=REPO_ROOT,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+        )
+    _wait_for_port(port, proc, "fake_comfyui_shared", log_path)
+    try:
+        yield port
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
 
 
 @pytest.fixture
@@ -257,5 +315,29 @@ def stack_with_models_dir(tmp_path) -> Any:
     s, cleanup = _make_stack(tmp_path, comfyui_base_dir=str(base_dir))
     try:
         yield s, base_dir
+    finally:
+        cleanup()
+
+
+@pytest.fixture
+def stack_with_cors(tmp_path) -> Any:
+    """Proxy with an explicit browser-origin allowlist (hosted app → localhost)."""
+    s, cleanup = _make_stack(tmp_path, cors_origins=["https://app.example.com"])
+    try:
+        yield s
+    finally:
+        cleanup()
+
+
+@pytest.fixture
+def stack_with_cors_and_token(tmp_path) -> Any:
+    """CORS allowlist plus bearer token — mirrors a hardened local browser setup."""
+    s, cleanup = _make_stack(
+        tmp_path,
+        token="secret",
+        cors_origins=["https://app.example.com"],
+    )
+    try:
+        yield s
     finally:
         cleanup()

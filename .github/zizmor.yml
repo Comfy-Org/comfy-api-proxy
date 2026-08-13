@@ -1,0 +1,7 @@
+# CLA Assistant requires `pull_request_target` so it can comment on fork PRs
+# and write CLA signatures with elevated permissions. The workflow does not
+# check out untrusted PR code; only GitHub API calls + the pinned CLA action.
+rules:
+  dangerous-triggers:
+    ignore:
+      - cla.yml

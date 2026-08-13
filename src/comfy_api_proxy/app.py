@@ -5,6 +5,10 @@ What each v2 operation maps to on ComfyUI:
 
   * ``POST /api/v2/jobs``        → resolve ``core/ASSET`` refs, then ``POST /prompt``
   * ``GET  /api/v2/jobs/{id}``   → ``/history/{id}`` (+ ``/queue`` for queued/running)
+  * ``GET  /api/v2/jobs/{id}/workflow`` → the proxy's own record of the
+                                   resolved (executed) graph, always
+                                   ``format: "api"`` (not ComfyUI's /history —
+                                   see ``_job_workflow``)
   * ``POST /api/v2/jobs/{id}/cancel`` → ``POST /api/jobs/{id}/cancel`` (atomic)
   * ``GET  /api/v2/jobs/{id}/events``  → live ``/ws`` translated to SSE
   * ``POST /api/v2/assets``      → ``POST /upload/image`` (inputs) or direct
@@ -40,6 +44,7 @@ import blake3
 from aiohttp import BodyPartReader, ClientError, ClientSession, ClientTimeout, FormData, web
 
 from .assets import AssetRecord, AssetStore
+from .persist import StateStore
 from .realtime import JobEventBridge
 from .security import (
     PlacementError,
@@ -78,6 +83,20 @@ _RETENTION = timedelta(hours=24)
 # realistic retry horizon for a single-instance proxy.
 _MAX_IDEMPOTENCY_KEY_LEN = 255
 _MAX_IDEMPOTENCY_KEYS = 10_000
+
+# Opaque job label (≤1 KiB UTF-8). Advisory priority — stored/echoed only;
+# never mapped to ComfyUI `front: true` (see docs/batch-workloads.md).
+_MAX_METADATA_BYTES = 1024
+_MIN_PRIORITY = -1_000_000
+_MAX_PRIORITY = 1_000_000
+
+_MAX_LIST_JOBS = 100
+_DEFAULT_LIST_JOBS = 50
+# GET /jobs resolves each candidate against ComfyUI (up to two upstream calls
+# per job), so a `status` filter that matches little would otherwise walk every
+# record a long-lived --state-dir has accumulated. Cap the walk and tell the
+# caller when it stopped early. Also caps how many records are reloaded at boot.
+_MAX_JOB_SCAN = 500
 
 
 def _error(status: int, code: str, message: str, **details: Any) -> web.Response:
@@ -134,6 +153,14 @@ class UpstreamUnreachable(Exception):
     instead of letting the raw transport error surface as a bare 500."""
 
 
+def _hash_file(path: Path) -> str:
+    digest = blake3.blake3()
+    with path.open("rb") as f:
+        while chunk := f.read(1 << 16):
+            digest.update(chunk)
+    return "blake3:" + digest.hexdigest()
+
+
 def _valid_job_id(job_id: str) -> bool:
     """Job ids are minted server-side as uuid4 strings (see Proxy.submit). A
     non-UUID id is never legitimate and — worse — would be spliced verbatim
@@ -155,6 +182,7 @@ class Proxy:
         *,
         comfyui_base_dir: str | None = None,
         max_upload_bytes: int = _DEFAULT_MAX_UPLOAD_BYTES,
+        state_dir: str | Path | None = None,
     ) -> None:
         self.comfyui = comfyui_url.rstrip("/")
         # Filesystem root of the ComfyUI install, if the proxy is co-located
@@ -164,22 +192,33 @@ class Proxy:
         self.base_dir = Path(comfyui_base_dir).resolve() if comfyui_base_dir else None
         self.max_upload_bytes = max_upload_bytes
         self.assets = AssetStore()
-        # job_id -> {"workflow": ..., "created_at": datetime, "client_id": str}
+        # job_id -> {"workflow": ..., "created_at": datetime, "client_id": str,
+        #            "metadata": str|None, "priority": int|None}
         self._jobs: dict[str, dict[str, Any]] = {}
-        # Claimed Idempotency-Key values (single-use, reject-on-duplicate — no
-        # replay, matching the v2 contract). In-memory for a per-instance
-        # self-hosted proxy: keys live for the process lifetime and a restart
-        # clears them. Bounded in size (see _MAX_IDEMPOTENCY_KEYS) with FIFO
-        # eviction; an OrderedDict is used as an ordered set so the oldest
-        # claim can be popped when the cap is reached.
+        # Claimed Idempotency-Key values (single-use). Bounded FIFO OrderedDict;
+        # with --state-dir claims also survive restart.
         self._idempotency_keys: collections.OrderedDict[str, None] = collections.OrderedDict()
         self._session: ClientSession | None = None
         self._open_streams = 0
-        # Per-process secret used to HMAC-sign stateless output asset ids
-        # (see _asset_id / _decode_asset_id) — random per Proxy instance, so
-        # a restart invalidates ids from a prior process rather than
-        # reusing a fixed key. Never persisted, never logged.
+        self._store: StateStore | None = None
+        # HMAC secret for output asset ids. Persisted under --state-dir so
+        # ids from a prior process remain verifiable. Never logged.
         self._asset_secret = os.urandom(32)
+        if state_dir is not None:
+            self._load_state(Path(state_dir))
+
+    def _load_state(self, state_dir: Path) -> None:
+        store = StateStore(state_dir / "state.sqlite3")
+        self._store = store
+        secret_hex = store.get_meta("asset_secret")
+        if secret_hex:
+            self._asset_secret = bytes.fromhex(secret_hex)
+        else:
+            store.set_meta("asset_secret", self._asset_secret.hex())
+        self.assets.attach_persist(store)
+        self._jobs = store.load_jobs(_MAX_JOB_SCAN)
+        for key in store.load_idempotency_keys():
+            self._idempotency_keys[key] = None
 
     # -- lifecycle -----------------------------------------------------------
     async def on_startup(self, app: web.Application) -> None:
@@ -188,6 +227,9 @@ class Proxy:
     async def on_cleanup(self, app: web.Application) -> None:
         if self._session is not None:
             await self._session.close()
+        if self._store is not None:
+            self._store.close()
+            self._store = None
 
     @property
     def session(self) -> ClientSession:
@@ -221,7 +263,7 @@ class Proxy:
         payload_b64 = base64.urlsafe_b64encode(raw).decode().rstrip("=")
         tag = hmac.new(self._asset_secret, payload_b64.encode(), hashlib.sha256).digest()
         tag_b64 = base64.urlsafe_b64encode(tag).decode().rstrip("=")
-        return f"asset_{payload_b64}.{tag_b64}"
+        return f"{payload_b64}.{tag_b64}"
 
     def _decode_asset_id(self, asset_id: str) -> dict[str, str] | None:
         """Decode + verify a stateless asset id minted by ``_asset_id``.
@@ -229,12 +271,9 @@ class Proxy:
         Returns ``None`` (treated as "unknown/not found" by every caller)
         for anything that isn't a well-formed, correctly-signed id —
         including a syntactically valid but forged one, closing the
-        "any well-formed asset_<...> id is trusted" gap.
+        "any well-formed payload.tag id is trusted" gap.
         """
-        if not asset_id.startswith("asset_"):
-            return None
-        rest = asset_id[len("asset_") :]
-        payload_b64, sep, tag_b64 = rest.partition(".")
+        payload_b64, sep, tag_b64 = asset_id.partition(".")
         if not sep:
             return None
         try:
@@ -265,6 +304,22 @@ class Proxy:
             raise UpstreamUnreachable(str(e)) from e
 
     # -- job status mapping --------------------------------------------------
+    def _outputs_reused(self, entry: dict[str, Any]) -> bool:
+        """True when ComfyUI actually served nodes from its execution cache.
+
+        ComfyUI emits ``execution_cached`` on *every* run — with an empty
+        ``nodes`` list when it cached nothing — so the message's presence alone
+        says nothing. Only a non-empty node list means outputs were reused.
+        """
+        messages = (entry.get("status") or {}).get("messages") or []
+        for message in messages:
+            if not isinstance(message, (list, tuple)) or len(message) != 2:
+                continue
+            ev, data = message
+            if ev == "execution_cached" and isinstance(data, dict) and data.get("nodes"):
+                return True
+        return False
+
     async def _status_of(self, job_id: str, base: str) -> dict[str, Any]:
         # 1) Terminal? history holds completed/failed jobs with their outputs.
         st, hist = await self._get_json(f"/history/{job_id}")
@@ -276,14 +331,24 @@ class Proxy:
             interrupted = any(
                 ev == "execution_interrupted" for ev, _ in messages if isinstance(ev, str)
             )
+            reused = self._outputs_reused(entry)
             if interrupted:
-                return {"status": "canceled", "outputs": self._outputs(job_id, entry, base)}
+                return {
+                    "status": "canceled",
+                    "outputs": self._outputs(job_id, entry, base),
+                    "outputs_reused": reused,
+                }
             if status_str == "success":
-                return {"status": "succeeded", "outputs": self._outputs(job_id, entry, base)}
+                return {
+                    "status": "succeeded",
+                    "outputs": self._outputs(job_id, entry, base),
+                    "outputs_reused": reused,
+                }
             return {
                 "status": "failed",
                 "outputs": self._outputs(job_id, entry, base),
                 "error": self._error_from(entry),
+                "outputs_reused": reused,
             }
         # 2) Not terminal: is it running or still queued?
         st, q = await self._get_json("/queue")
@@ -295,15 +360,17 @@ class Proxy:
                     "status": "running",
                     "outputs": [],
                     "progress": self._running_progress(),
+                    "outputs_reused": False,
                 }
             if job_id in pending:
                 return {
                     "status": "queued",
                     "outputs": [],
                     "queue_position": pending.index(job_id) + 1,
+                    "outputs_reused": False,
                 }
         # 3) Unknown to ComfyUI (never accepted, or evicted/restarted).
-        return {"status": "unknown", "outputs": []}
+        return {"status": "unknown", "outputs": [], "outputs_reused": False}
 
     def _running_progress(self) -> dict[str, Any]:
         # The poll path has no live step counter; report an indeterminate but
@@ -336,6 +403,7 @@ class Proxy:
                             "hash": None,
                             "url": f"{base}/api/v2/assets/{aid}/content",
                             "url_expires_at": _iso(now + _RETENTION),
+                            "job_id": job_id,
                         }
                     )
         return out
@@ -358,13 +426,57 @@ class Proxy:
             "traceback": None,
         }
 
+    def _job_meta(self, job_id: str) -> dict[str, Any]:
+        """Proxy-layer fields for one job: memory first, then --state-dir.
+
+        Only the newest _MAX_JOB_SCAN rows reload into memory, while ComfyUI's
+        history ring keeps a job answerable for days longer. Without the SQLite
+        fallback a job in that gap still returns 200 (upstream resolves it) but
+        loses the metadata/priority/created_at --state-dir exists to preserve.
+        """
+        meta = self._jobs.get(job_id)
+        if meta is not None:
+            return meta
+        if self._store is None:
+            return {}
+        return self._store.get_job(job_id) or {}
+
+    def _knows_job(self, job_id: str) -> bool:
+        return bool(self._job_meta(job_id))
+
+    def _job_workflow(self, job_id: str) -> dict[str, Any] | None:
+        """The API-format graph ``job_id`` actually ran with (core/ASSET refs
+        already resolved to filenames — see ``resolved_workflow`` in
+        ``submit``), or None if this proxy can no longer produce it (never
+        seen, evicted from the in-memory window, or --state-dir isn't in
+        use).
+
+        Deliberately NOT read from ComfyUI's own /history: even though it
+        holds the same resolved graph, it carries this proxy's own
+        extra_data (partner API key) alongside it, which our own record
+        never does — reading from history would risk leaking that credential.
+
+        A record reloaded into memory by ``_load_state`` (via ``store.load_jobs``)
+        has no "workflow" key at all — that startup path deliberately skips
+        hydrating it (see ``StateStore.load_jobs``) — so its presence, not
+        just the meta dict's presence, decides whether to trust memory or
+        fall through to the store's dedicated column read.
+        """
+        meta = self._jobs.get(job_id)
+        if meta is not None and "workflow" in meta:
+            workflow = meta["workflow"]
+            return workflow if isinstance(workflow, dict) else None
+        if self._store is not None:
+            return self._store.get_job_workflow(job_id)
+        return None
+
     def _job(self, job_id: str, state: dict[str, Any], base: str) -> dict[str, Any]:
-        meta = self._jobs.get(job_id, {})
+        meta = self._job_meta(job_id)
         created = meta.get("created_at", _now())
         status = state["status"]
         if status == "unknown":
             status = "expired"  # known-to-proxy but gone upstream => expired
-        return {
+        body: dict[str, Any] = {
             "id": job_id,
             "status": status,
             "created_at": _iso(created),
@@ -375,12 +487,62 @@ class Proxy:
             "progress": state.get("progress"),
             "outputs": state.get("outputs", []),
             "error": state.get("error"),
+            "outputs_reused": bool(state.get("outputs_reused", False)),
             "urls": {
                 "self": f"{base}/api/v2/jobs/{job_id}",
                 "events": f"{base}/api/v2/jobs/{job_id}/events",
                 "cancel": f"{base}/api/v2/jobs/{job_id}/cancel",
             },
         }
+        # Omit unset optional fields so strict clients still validate.
+        if meta.get("metadata") is not None:
+            body["metadata"] = meta["metadata"]
+        if meta.get("priority") is not None:
+            body["priority"] = meta["priority"]
+        return body
+
+    def _remember_job(
+        self,
+        job_id: str,
+        *,
+        workflow: dict[str, Any],
+        metadata: str | None,
+        priority: int | None,
+    ) -> None:
+        record = {
+            "id": job_id,
+            "workflow": workflow,
+            "created_at": _now(),
+            "client_id": job_id,
+            "metadata": metadata,
+            "priority": priority,
+        }
+        self._jobs[job_id] = record
+        if self._store is not None:
+            self._store.upsert_job(record)
+
+    def _claim_idempotency(self, key: str) -> bool:
+        """Claim ``key``. Return False if already claimed."""
+        if key in self._idempotency_keys:
+            return False
+        if self._store is not None and not self._store.claim_idempotency(
+            key, claimed_at=_iso(_now())
+        ):
+            # Already claimed in a prior process (or race) — mirror into memory.
+            self._idempotency_keys[key] = None
+            return False
+        self._idempotency_keys[key] = None
+        if len(self._idempotency_keys) > _MAX_IDEMPOTENCY_KEYS:
+            oldest, _ = self._idempotency_keys.popitem(last=False)
+            if self._store is not None:
+                self._store.release_idempotency(oldest)
+                self._store.trim_idempotency(_MAX_IDEMPOTENCY_KEYS)
+        return True
+
+    def _release_idempotency(self, key: str) -> None:
+        self._idempotency_keys.pop(key, None)
+        if self._store is not None:
+            self._store.release_idempotency(key)
 
     # ==== core/ASSET walker =================================================
     def _resolve_asset_ref(self, info: dict[str, Any]) -> str | None:
@@ -435,6 +597,53 @@ class Proxy:
         return node
 
     # ==== job handlers ======================================================
+    def _parse_submit_extras(
+        self, body: dict[str, Any]
+    ) -> tuple[str | None, int | None, web.Response | None]:
+        """Validate optional ``metadata`` / ``priority`` on POST /jobs."""
+        metadata: str | None = None
+        if "metadata" in body and body["metadata"] is not None:
+            raw = body["metadata"]
+            if not isinstance(raw, str):
+                return (
+                    None,
+                    None,
+                    _error(422, "invalid_request", "'metadata' must be a string (opaque label)."),
+                )
+            if len(raw.encode("utf-8")) > _MAX_METADATA_BYTES:
+                return (
+                    None,
+                    None,
+                    _error(
+                        422,
+                        "invalid_request",
+                        f"'metadata' exceeds {_MAX_METADATA_BYTES} UTF-8 bytes.",
+                    ),
+                )
+            metadata = raw
+
+        priority: int | None = None
+        if "priority" in body and body["priority"] is not None:
+            raw_p = body["priority"]
+            if isinstance(raw_p, bool) or not isinstance(raw_p, int):
+                return (
+                    None,
+                    None,
+                    _error(422, "invalid_request", "'priority' must be an integer (advisory)."),
+                )
+            if raw_p < _MIN_PRIORITY or raw_p > _MAX_PRIORITY:
+                return (
+                    None,
+                    None,
+                    _error(
+                        422,
+                        "invalid_request",
+                        f"'priority' must be between {_MIN_PRIORITY} and {_MAX_PRIORITY}.",
+                    ),
+                )
+            priority = raw_p
+        return metadata, priority, None
+
     async def submit(self, request: web.Request) -> web.Response:
         try:
             body = await request.json()
@@ -455,6 +664,10 @@ class Proxy:
                 "workflow_format_ui",
                 "This is a UI-export graph. Export the workflow in API format instead.",
             )
+
+        metadata, priority, extras_err = self._parse_submit_extras(body)
+        if extras_err is not None:
+            return extras_err
 
         # Optional, typed, CLOSED extra_data (mirrors the v2 contract's
         # `additionalProperties: false`): the only accepted key is
@@ -523,16 +736,13 @@ class Proxy:
                     "invalid_request",
                     f"Idempotency-Key must be 1-{_MAX_IDEMPOTENCY_KEY_LEN} characters.",
                 )
-            if key in self._idempotency_keys:
+            if not self._claim_idempotency(key):
                 return _error(
                     422,
                     "idempotency_key_reuse",
                     "This Idempotency-Key has already been used. Keys are single-use; "
                     "poll or list your jobs instead of resubmitting with the same key.",
                 )
-            self._idempotency_keys[key] = None
-            if len(self._idempotency_keys) > _MAX_IDEMPOTENCY_KEYS:
-                self._idempotency_keys.popitem(last=False)  # evict oldest (FIFO)
 
         payload = {
             "prompt": resolved_workflow,
@@ -554,7 +764,7 @@ class Proxy:
                     # reading the body — a failed body read must not turn a
                     # definite rejection into a (wrongly) held key.
                     if key:
-                        self._idempotency_keys.pop(key, None)
+                        self._release_idempotency(key)
                     try:
                         data = await r.json() if r.content_type == "application/json" else {}
                     except (ClientError, asyncio.TimeoutError, ValueError):
@@ -566,11 +776,75 @@ class Proxy:
             # Unknown outcome — ComfyUI may already hold the prompt. HOLD the
             # key (do not release) so a same-key retry can't double-submit.
             return _error(503, "upstream_unreachable", "Could not reach ComfyUI to submit the job.")
-        self._jobs[job_id] = {"workflow": workflow, "created_at": _now(), "client_id": job_id}
+        # Store the RESOLVED graph (core/ASSET refs replaced with filenames) —
+        # what actually ran, matching GET /jobs/{id}/workflow's contract and
+        # Cloud's own behavior — not the as-submitted `workflow`.
+        self._remember_job(job_id, workflow=resolved_workflow, metadata=metadata, priority=priority)
         base = _external_base(request)
         return web.json_response(
-            self._job(job_id, {"status": "queued", "outputs": []}, base), status=201
+            self._job(job_id, {"status": "queued", "outputs": [], "outputs_reused": False}, base),
+            status=201,
         )
+
+    async def list_jobs(self, request: web.Request) -> web.Response:
+        """List jobs this proxy recorded. Optional ``status`` / ``limit``."""
+        limit_raw = request.rel_url.query.get("limit", str(_DEFAULT_LIST_JOBS))
+        try:
+            limit = int(limit_raw)
+        except (TypeError, ValueError):
+            return _error(400, "invalid_request", "'limit' must be an integer.")
+        if limit < 1 or limit > _MAX_LIST_JOBS:
+            return _error(
+                400,
+                "invalid_request",
+                f"'limit' must be between 1 and {_MAX_LIST_JOBS}.",
+            )
+        status_filter: set[str] | None = None
+        status_q = request.rel_url.query.get("status")
+        if status_q:
+            status_filter = {s.strip() for s in status_q.split(",") if s.strip()}
+            allowed = {
+                "queued",
+                "running",
+                "succeeded",
+                "canceling",
+                "canceled",
+                "failed",
+                "expired",
+            }
+            bad = status_filter - allowed
+            if bad:
+                return _error(
+                    400,
+                    "invalid_request",
+                    f"Unknown status filter value(s): {', '.join(sorted(bad))}.",
+                )
+
+        base = _external_base(request)
+        epoch = datetime.min.replace(tzinfo=timezone.utc)
+        job_ids = sorted(
+            self._jobs.keys(),
+            key=lambda jid: self._jobs[jid].get("created_at", epoch),
+            reverse=True,
+        )
+        jobs: list[dict[str, Any]] = []
+        scanned = 0
+        for job_id in job_ids:
+            if len(jobs) >= limit or scanned >= _MAX_JOB_SCAN:
+                break
+            scanned += 1
+            try:
+                state = await self._status_of(job_id, base)
+            except UpstreamUnreachable:
+                return _error(503, "upstream_unreachable", "Could not reach ComfyUI.")
+            job = self._job(job_id, state, base)
+            if status_filter is not None and job["status"] not in status_filter:
+                continue
+            jobs.append(job)
+        # True when the scan cap stopped us before `limit` was satisfied, so a
+        # caller can tell "no more matches" apart from "stopped looking".
+        truncated = len(jobs) < limit and scanned < len(job_ids)
+        return web.json_response({"jobs": jobs, "truncated": truncated})
 
     async def get_job(self, request: web.Request) -> web.Response:
         job_id = request.match_info["id"]
@@ -581,16 +855,30 @@ class Proxy:
             state = await self._status_of(job_id, base)
         except UpstreamUnreachable:
             return _error(503, "upstream_unreachable", "Could not reach ComfyUI.")
-        if state["status"] == "unknown" and job_id not in self._jobs:
+        if state["status"] == "unknown" and not self._knows_job(job_id):
             return _error(404, "not_found", f"No job {job_id}.")
         return web.json_response(self._job(job_id, state, base))
+
+    async def get_job_workflow(self, request: web.Request) -> web.Response:
+        job_id = request.match_info["id"]
+        if not _valid_job_id(job_id):
+            return _error(404, "not_found", f"No job {job_id}.")
+        workflow = self._job_workflow(job_id)
+        if workflow is None:
+            return _error(404, "not_found", f"No recoverable workflow for job {job_id}.")
+        # `format` discriminates save-format (authoring) vs. api-format
+        # (executed) graphs — Cloud can return either depending on whether a
+        # job pins a workflow version; this proxy has no version concept and
+        # always returns the executed graph, but sets the field regardless so
+        # a client sees the same response shape against either backend.
+        return web.json_response({"workflow": workflow, "format": "api"})
 
     async def cancel_job(self, request: web.Request) -> web.Response:
         job_id = request.match_info["id"]
         if not _valid_job_id(job_id):
             return _error(404, "not_found", f"No job {job_id}.")
         base = _external_base(request)
-        if job_id not in self._jobs:
+        if not self._knows_job(job_id):
             # Allow cancel of an id ComfyUI still knows even if the proxy
             # restarted; a wholly unknown id is a 404.
             try:
@@ -624,7 +912,7 @@ class Proxy:
             state = await self._status_of(job_id, base)
         except UpstreamUnreachable:
             return _error(503, "upstream_unreachable", "Could not reach ComfyUI.")
-        if state["status"] == "unknown" and job_id not in self._jobs:
+        if state["status"] == "unknown" and not self._knows_job(job_id):
             return _error(404, "not_found", f"No job {job_id}.")
         if self._open_streams >= _MAX_CONCURRENT_STREAMS:
             resp = _error(
@@ -659,9 +947,9 @@ class Proxy:
         # Connect the WS bridge with the SAME client_id the job was
         # submitted under (see submit()), so ComfyUI's per-client-addressed
         # events actually reach this connection. Fall back to job_id itself
-        # if the proxy has no record of the job (e.g. restarted) — that
-        # matches what submit() would have used anyway.
-        client_id = self._jobs.get(job_id, {}).get("client_id", job_id)
+        # if the proxy has no record of the job at all — that matches what
+        # submit() would have used anyway.
+        client_id = self._job_meta(job_id).get("client_id", job_id)
         bridge = JobEventBridge(
             self.comfyui, job_id, client_id=client_id, snapshot=snapshot, session=self.session
         )
@@ -923,24 +1211,34 @@ class Proxy:
         if decoded is not None:
             now = _now()
             ctype = mimetypes.guess_type(decoded["f"])[0] or "application/octet-stream"
-            return web.json_response(
-                {
-                    "id": asset_id,
-                    "hash": None,
-                    "size_bytes": 0,
-                    "content_type": ctype,
-                    "file_path": decoded["f"],
-                    "created_at": _iso(now),
-                    "url": f"{base}/api/v2/assets/{asset_id}/content",
-                    "url_expires_at": _iso(now + _RETENTION),
-                }
-            )
+            body: dict[str, Any] = {
+                "id": asset_id,
+                "hash": None,
+                "size_bytes": 0,
+                "content_type": ctype,
+                "file_path": decoded["f"],
+                "created_at": _iso(now),
+                "url": f"{base}/api/v2/assets/{asset_id}/content",
+                "url_expires_at": _iso(now + _RETENTION),
+            }
+            # "j" is absent on ids minted before per-job-scoping (see
+            # _decode_asset_id) — omit rather than fabricate a job_id for those.
+            if "j" in decoded:
+                body["job_id"] = decoded["j"]
+            return web.json_response(body)
         return _error(404, "not_found", "Unknown asset id.")
 
     async def get_asset_content(self, request: web.Request) -> web.StreamResponse:
         asset_id = request.match_info["id"]
         record = self.assets.get(asset_id)
         if record is not None and record.disk_path:
+            if not Path(record.disk_path).is_file():
+                return _error(
+                    404,
+                    "output_unavailable",
+                    "The asset is registered but its bytes are no longer on disk. "
+                    "Retrying cannot help; re-execute with a changed prompt hash.",
+                )
             # Proxy-placed file on disk: FileResponse handles Range/206 natively.
             return web.FileResponse(record.disk_path)
         if record is not None and record.comfy_ref:
@@ -971,11 +1269,14 @@ class Proxy:
         if upstream.status not in (200, 206):
             status = upstream.status
             upstream.release()
-            # A genuine 404 means the output isn't there; any other non-2xx
-            # (a ComfyUI-side 5xx, 403, ...) is an upstream failure, not a
-            # "never existed" — surface it as such instead of masking it as 404.
+            # Typed signal: output bytes are gone (not a transient miss).
             if status == 404:
-                return _error(404, "not_found", "Output not available upstream.")
+                return _error(
+                    404,
+                    "output_unavailable",
+                    "Output bytes are no longer retrievable upstream. "
+                    "Retrying cannot help; re-execute with a changed prompt hash.",
+                )
             return _error(
                 502, "upstream_error", "ComfyUI returned an unexpected status for the output."
             )
@@ -1009,7 +1310,125 @@ class Proxy:
             body["created_new"] = created_new
         return body
 
+    async def asset_from_path(self, request: web.Request) -> web.Response:
+        """Register a host file under ``--comfyui-base-dir`` without copying."""
+        if self.base_dir is None:
+            return _error(
+                422,
+                "invalid_request",
+                "Host-path registration requires --comfyui-base-dir "
+                "(the proxy must share a filesystem with ComfyUI).",
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            return _error(400, "invalid_request", "Body must be JSON.")
+        path_raw = body.get("path")
+        if not isinstance(path_raw, str) or not path_raw:
+            return _error(422, "invalid_request", "Missing 'path' (absolute host path).")
+        file_path = body.get("file_path")
+        if file_path is not None and not isinstance(file_path, str):
+            return _error(422, "invalid_request", "'file_path' must be a string when provided.")
+
+        try:
+            src = Path(path_raw).resolve(strict=True)
+        except (OSError, RuntimeError):
+            return _error(404, "blob_not_found", "Host path does not exist.")
+        if not src.is_file():
+            return _error(404, "blob_not_found", "Host path is not a regular file.")
+
+        # Path must resolve under --comfyui-base-dir.
+        try:
+            rel = src.relative_to(self.base_dir)
+        except ValueError:
+            return _error(
+                422,
+                "invalid_request",
+                "Host path must resolve under --comfyui-base-dir.",
+            )
+        parts = rel.parts
+        if not parts:
+            return _error(422, "invalid_request", "Host path must be a file under the install.")
+
+        top = parts[0]
+        size = src.stat().st_size
+        if size > self.max_upload_bytes:
+            return _error(
+                413,
+                "payload_too_large",
+                f"Host file exceeds {self.max_upload_bytes} bytes.",
+            )
+
+        # Off the event loop: ~0.5s per GiB, and registering model files is the
+        # reason an operator raises --max-upload-mb past the 100 MB default.
+        # Blocking here would stall every open SSE stream for that long.
+        computed_hash = await asyncio.to_thread(_hash_file, src)
+        existing = self.assets.get_by_hash(computed_hash)
+        base = _external_base(request)
+        if existing is not None:
+            return web.json_response(
+                self._asset_json(existing, created_new=False, base=base), status=200
+            )
+
+        content_type = (
+            body.get("content_type")
+            if isinstance(body.get("content_type"), str)
+            else (mimetypes.guess_type(src.name)[0] or "application/octet-stream")
+        )
+
+        if top == "models":
+            # Reuse the upload path validator for allowlisted model roots.
+            try:
+                is_model, norm = validate_upload_path("/".join(parts))
+            except PlacementError as e:
+                return _error(422, "invalid_request", str(e))
+            if not is_model:
+                return _error(422, "invalid_request", "Invalid model path under models/.")
+            with src.open("rb") as f:
+                head = f.read(1 << 20)
+            if not looks_like_safetensors(head):
+                return _error(
+                    422,
+                    "invalid_request",
+                    "Model registrations must be valid safetensors files.",
+                )
+            root_relative = posixpath.join(*Path(norm).parts[1:])
+            record = self.assets.add(
+                hash_=computed_hash,
+                size_bytes=size,
+                content_type=content_type,
+                file_path=file_path or root_relative,
+                disk_path=str(src),
+            )
+            return web.json_response(
+                self._asset_json(record, created_new=True, base=base), status=201
+            )
+
+        if top not in ("input", "output", "temp"):
+            return _error(
+                422,
+                "invalid_request",
+                "Host path must be under input/, output/, temp/, or models/.",
+            )
+        # ComfyUI /view reference: type = top-level dir; rest is subfolder/filename.
+        remainder = parts[1:]
+        if not remainder:
+            return _error(422, "invalid_request", "Host path must include a filename.")
+        filename = remainder[-1]
+        subfolder = "/".join(remainder[:-1])
+        display_path = file_path or "/".join(parts)
+        record = self.assets.add(
+            hash_=computed_hash,
+            size_bytes=size,
+            content_type=content_type,
+            file_path=display_path,
+            comfy_ref={"filename": filename, "subfolder": subfolder, "type": top},
+            disk_path=str(src),
+        )
+        return web.json_response(self._asset_json(record, created_new=True, base=base), status=201)
+
     async def health(self, request: web.Request) -> web.Response:
+        # Does not probe ComfyUI — process reachability only.
         return web.json_response({"status": "healthy", "upstream": self.comfyui})
 
 
@@ -1018,12 +1437,14 @@ def make_app(
     *,
     comfyui_base_dir: str | None = None,
     max_upload_bytes: int = _DEFAULT_MAX_UPLOAD_BYTES,
+    state_dir: str | Path | None = None,
     middlewares: list[Any] | None = None,
 ) -> web.Application:
     proxy = Proxy(
         comfyui_url,
         comfyui_base_dir=comfyui_base_dir,
         max_upload_bytes=max_upload_bytes,
+        state_dir=state_dir,
     )
     app = web.Application(
         client_max_size=max_upload_bytes + (1 << 20),
@@ -1036,12 +1457,15 @@ def make_app(
             web.get("/api/v2/health", proxy.health),
             # jobs
             web.post("/api/v2/jobs", proxy.submit),
+            web.get("/api/v2/jobs", proxy.list_jobs),
             web.get("/api/v2/jobs/{id}", proxy.get_job),
+            web.get("/api/v2/jobs/{id}/workflow", proxy.get_job_workflow),
             web.post("/api/v2/jobs/{id}/cancel", proxy.cancel_job),
             web.get("/api/v2/jobs/{id}/events", proxy.job_events),
             # assets
             web.post("/api/v2/assets", proxy.upload_asset),
             web.post("/api/v2/assets/from-hash", proxy.asset_from_hash),
+            web.post("/api/v2/assets/from-path", proxy.asset_from_path),
             web.head("/api/v2/assets/by-hash/{hash}", proxy.head_asset_by_hash),
             web.get("/api/v2/assets/{id}", proxy.get_asset),
             web.get("/api/v2/assets/{id}/content", proxy.get_asset_content),
