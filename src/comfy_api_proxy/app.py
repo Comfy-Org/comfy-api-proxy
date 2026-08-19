@@ -60,6 +60,7 @@ _OUTPUT_KIND = {
     "gifs": "video",
     "audio": "audio",
     "text": "text",
+    "files": "file",
     "latents": "latent",
 }
 

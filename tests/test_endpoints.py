@@ -547,6 +547,30 @@ def test_output_asset_ids_are_scoped_per_job(stack):
     assert out1["url"] != out2["url"]
 
 
+def test_save_text_outputs_file_key():
+    # SaveText nodes emit both "text" (list of strings) and "files" (list of
+    # dicts with filenames). The proxy must surface the file entries as outputs
+    # so the SDK can download them via GET /api/v2/assets/{id}/content.
+    from comfy_api_proxy.app import Proxy
+
+    proxy = Proxy(comfyui_url="http://127.0.0.1:8188")
+    entry = {
+        "outputs": {
+            "2": {
+                "text": ["hello from save text"],
+                "files": [{"filename": "ComfyUI_00001.txt", "subfolder": "", "type": "output"}],
+            }
+        },
+        "status": {"status_str": "success", "messages": []},
+    }
+    outputs = proxy._outputs("test-job-id", entry, "http://proxy")
+    file_outputs = [o for o in outputs if o["type"] == "file"]
+    assert len(file_outputs) == 1
+    assert file_outputs[0]["name"] == "ComfyUI_00001.txt"
+    assert file_outputs[0]["content_type"] == "text/plain"
+    assert file_outputs[0]["node_id"] == "2"
+
+
 def test_realtime_parsers_ignore_non_dict_json_frames():
     # A valid-JSON but non-object WS frame (plausibly from a buggy/malicious
     # custom node) must not crash the stream with an AttributeError.
