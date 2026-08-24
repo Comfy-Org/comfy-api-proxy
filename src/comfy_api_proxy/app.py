@@ -34,6 +34,7 @@ import json
 import mimetypes
 import os
 import posixpath
+import sys
 import tempfile
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -224,6 +225,25 @@ class Proxy:
     # -- lifecycle -----------------------------------------------------------
     async def on_startup(self, app: web.Application) -> None:
         self._session = ClientSession(timeout=ClientTimeout(total=None, sock_connect=10))
+        self._cleanup_task: asyncio.Task[None] | None = None
+        if self._store is not None:
+            # Persist task already started by _load_state — nothing to do.
+            pass
+        else:
+            # In-memory mode: run periodic cleanup of expired assets.
+            self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+
+    async def _cleanup_loop(self) -> None:
+        """Periodically remove assets whose expires_at has passed."""
+        interval = int(os.environ.get("COMFY_ASSET_CLEANUP_INTERVAL", "300"))
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                deleted = self.assets.delete_expired(_iso(_now()))
+                if deleted:
+                    print(f"Cleaned up {len(deleted)} expired asset(s)")
+            except Exception:
+                print("Error during asset cleanup", file=sys.stderr)
 
     async def on_cleanup(self, app: web.Application) -> None:
         if self._session is not None:
@@ -231,6 +251,10 @@ class Proxy:
         if self._store is not None:
             self._store.close()
             self._store = None
+        if self._cleanup_task is not None:
+            self._cleanup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._cleanup_task
 
     @property
     def session(self) -> ClientSession:
@@ -986,6 +1010,7 @@ class Proxy:
         size = 0
         digest = blake3.blake3()
         part_content_type = "application/octet-stream"
+        expires_in: int | None = None
 
         try:
             # mypy/aiohttp-stubs disagree on MultipartReader.__aiter__'s self
@@ -1018,6 +1043,11 @@ class Proxy:
                             f.write(chunk)
                 elif part.name == "tags":
                     tags.append((await part.text()).strip())
+                elif part.name == "expires_in":
+                    try:
+                        expires_in = int((await part.text()).strip())
+                    except ValueError:
+                        pass
                 else:
                     fields[part.name] = (await part.text()).strip()
 
@@ -1062,11 +1092,11 @@ class Proxy:
 
             if is_model:
                 record, err = self._place_model_file(
-                    norm_path, data, computed_hash, content_type, size, tags
+                    norm_path, data, computed_hash, content_type, size, tags, expires_in
                 )
             else:
                 record, err = await self._upload_input(
-                    norm_path, file_path, data, computed_hash, content_type, size, tags
+                    norm_path, file_path, data, computed_hash, content_type, size, tags, expires_in
                 )
             if err is not None:
                 return err
@@ -1087,6 +1117,7 @@ class Proxy:
         content_type: str,
         size: int,
         tags: list[str],
+        expires_in: int | None = None,
     ) -> tuple[AssetRecord | None, web.Response | None]:
         if self.base_dir is None:
             return None, _error(
@@ -1134,6 +1165,7 @@ class Proxy:
             file_path=root_relative,
             disk_path=str(dest),
             tags=tags,
+            expires_at=_iso(_now() + timedelta(seconds=expires_in)) if expires_in else None,
         )
         return record, None
 
@@ -1146,6 +1178,7 @@ class Proxy:
         content_type: str,
         size: int,
         tags: list[str],
+        expires_in: int | None = None,
     ) -> tuple[AssetRecord | None, web.Response | None]:
         # `norm` is already validated + "input/"-prefix-stripped by
         # validate_upload_path (called once, before the model/input branch
@@ -1181,6 +1214,7 @@ class Proxy:
             },
             tags=tags,
             asset_id=comfy_asset_id,
+            expires_at=_iso(_now() + timedelta(seconds=expires_in)) if expires_in else None,
         )
         return record, None
 
@@ -1196,8 +1230,8 @@ class Proxy:
         if record is None:
             # A miss and "exists but not yours" are deliberately identical.
             return _error(404, "blob_not_found", "No blob the caller may mint from.")
-        # Single-user self-hosted: minting a second reference over the same
-        # blob returns the same asset (the reference already exists).
+        # For a dedup hit the asset already exists; we return it as-is.
+        # (Extending retention on re-reference is handled by post_assets on new uploads.)
         base = _external_base(request)
         return web.json_response(self._asset_json(record, created_new=False, base=base), status=200)
 
@@ -1338,6 +1372,8 @@ class Proxy:
         }
         if created_new is not None:
             body["created_new"] = created_new
+        if record.expires_at is not None:
+            body["expires_at"] = record.expires_at
         return body
 
     async def asset_from_path(self, request: web.Request) -> web.Response:

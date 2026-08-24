@@ -40,6 +40,7 @@ class AssetRecord:
     content_type: str
     file_path: str | None
     created_at: str
+    expires_at: str | None = None
     # Retrieval — exactly one of these is set.
     comfy_ref: dict[str, str] | None = None  # {filename, subfolder, type} for /view
     disk_path: str | None = None  # absolute path for proxy-placed / host files
@@ -90,6 +91,7 @@ class AssetStore:
         disk_path: str | None = None,
         tags: list[str] | None = None,
         asset_id: str | None = None,
+        expires_at: str | None = None,
     ) -> AssetRecord:
         """Mint and store a new asset record, indexing it by hash."""
         record = AssetRecord(
@@ -99,6 +101,7 @@ class AssetStore:
             content_type=content_type,
             file_path=file_path,
             created_at=_now_iso(),
+            expires_at=expires_at,
             comfy_ref=comfy_ref,
             disk_path=disk_path,
             tags=tags or [],
@@ -163,3 +166,28 @@ class AssetStore:
         record = self._by_id.pop(asset_id, None)
         if record is not None and record.hash and self._id_by_hash.get(record.hash) == asset_id:
             self._id_by_hash.pop(record.hash, None)
+
+    def delete_expired(self, now: str) -> list[str]:
+        """Remove all assets whose expires_at is before *now*.
+
+        Returns the list of deleted asset ids (also persisted).
+        """
+        from datetime import datetime, timezone
+
+        cutoff = datetime.fromisoformat(now).replace(tzinfo=timezone.utc)
+        deleted: list[str] = []
+        for asset_id, record in list(self._by_id.items()):
+            if record.expires_at is None:
+                continue
+            try:
+                expires = datetime.fromisoformat(record.expires_at).replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                continue
+            if expires <= cutoff:
+                deleted.append(asset_id)
+                self._by_id.pop(asset_id, None)
+                if record.hash and self._id_by_hash.get(record.hash) == asset_id:
+                    self._id_by_hash.pop(record.hash, None)
+                if self._persist is not None:
+                    self._persist.delete_asset(asset_id)
+        return deleted
