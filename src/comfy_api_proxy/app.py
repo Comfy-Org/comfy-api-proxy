@@ -1292,8 +1292,11 @@ class Proxy:
         return _error(404, "not_found", "Unknown asset id.")
 
     async def _stream_view(self, request: web.Request, ref: dict[str, str]) -> web.StreamResponse:
+        # ref["filename"] may be a full path (e.g. /data/output/file.png);
+        # ComfyUI's /view expects just the basename.
+        filename = Path(ref["filename"]).name
         params = {
-            "filename": ref["filename"],
+            "filename": filename,
             "subfolder": ref.get("subfolder", ""),
             "type": ref.get("type", "output"),
         }
