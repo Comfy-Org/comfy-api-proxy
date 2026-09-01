@@ -1320,17 +1320,24 @@ class Proxy:
             return _error(
                 502, "upstream_error", "ComfyUI returned an unexpected status for the output."
             )
-        out = web.StreamResponse(status=upstream.status)
-        out.content_type = upstream.content_type
-        for h in ("Content-Length", "Content-Range", "Accept-Ranges"):
-            if h in upstream.headers:
-                out.headers[h] = upstream.headers[h]
-        await out.prepare(request)
-        async for chunk in upstream.content.iter_chunked(1 << 16):
-            await out.write(chunk)
-        upstream.release()
-        await out.write_eof()
-        return out
+        completed = False
+        try:
+            out = web.StreamResponse(status=upstream.status)
+            out.content_type = upstream.content_type
+            for h in ("Content-Length", "Content-Range", "Accept-Ranges"):
+                if h in upstream.headers:
+                    out.headers[h] = upstream.headers[h]
+            await out.prepare(request)
+            async for chunk in upstream.content.iter_chunked(1 << 16):
+                await out.write(chunk)
+            await out.write_eof()
+            completed = True
+            return out
+        finally:
+            if completed:
+                upstream.release()
+            else:
+                upstream.close()
 
     async def delete_asset(self, request: web.Request) -> web.Response:
         asset_id = request.match_info["id"]

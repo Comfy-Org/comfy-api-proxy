@@ -1191,3 +1191,75 @@ async def test_asset_content_upstream_5xx_maps_to_502_but_404_stays_404():
         resp = await proxy.get_asset_content(req)
         assert resp.status == expected_status, (upstream_status, resp.status)
         assert json.loads(resp.body)["error"]["code"] == expected_code
+
+
+@pytest.mark.parametrize("disconnect", [False, True], ids=["complete", "disconnect"])
+async def test_asset_content_cleans_up_upstream_response(monkeypatch, disconnect):
+    from aiohttp.test_utils import make_mocked_request
+
+    from comfy_api_proxy import app as app_module
+    from comfy_api_proxy.app import Proxy
+
+    class _Content:
+        async def iter_chunked(self, size):  # noqa: ANN001
+            yield b"image bytes"
+
+    class _Upstream:
+        status = 200
+        content_type = "image/png"
+        headers: dict[str, str] = {}
+        content = _Content()
+
+        def __init__(self) -> None:
+            self.closed = False
+            self.released = False
+
+        def close(self) -> None:
+            self.closed = True
+
+        def release(self) -> None:
+            self.released = True
+
+    class _Session:
+        def __init__(self, response) -> None:  # noqa: ANN001
+            self.response = response
+
+        async def get(self, url, params=None, headers=None):  # noqa: ANN001
+            return self.response
+
+    class _Downstream:
+        def __init__(self, *, status: int) -> None:
+            self.status = status
+            self.content_type = ""
+            self.headers: dict[str, str] = {}
+
+        async def prepare(self, request):  # noqa: ANN001
+            pass
+
+        async def write(self, chunk):  # noqa: ANN001
+            if disconnect:
+                raise ConnectionResetError("client disconnected")
+
+        async def write_eof(self) -> None:
+            pass
+
+    upstream = _Upstream()
+    proxy = Proxy("http://comfy")
+    proxy._session = _Session(upstream)  # type: ignore[assignment]
+    record = proxy.assets.register_comfy_output(
+        filename="out.png", subfolder="", type_="output", content_type="image/png"
+    )
+    request = make_mocked_request(
+        "GET", f"/api/v2/assets/{record.id}/content", match_info={"id": record.id}
+    )
+    monkeypatch.setattr(app_module.web, "StreamResponse", _Downstream)
+
+    if disconnect:
+        with pytest.raises(ConnectionResetError, match="client disconnected"):
+            await proxy.get_asset_content(request)
+    else:
+        response = await proxy.get_asset_content(request)
+        assert response.status == 200
+
+    assert upstream.closed is disconnect
+    assert upstream.released is not disconnect
