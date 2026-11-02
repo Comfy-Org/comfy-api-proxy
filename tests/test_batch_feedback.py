@@ -383,8 +383,9 @@ async def test_list_jobs_scan_is_bounded():
     body = json.loads(resp.body)
     assert body["jobs"] == []
     assert body["truncated"] is True
-    # Two upstream calls per scanned candidate, and never more than the cap.
-    assert calls["n"] <= 2 * _MAX_JOB_SCAN
+    # Two upstream calls per candidate, plus at most one aggregated worker
+    # queue snapshot shared across the entire list (including plain ComfyUI).
+    assert calls["n"] <= 2 * _MAX_JOB_SCAN + 1
     assert calls["n"] < 2 * overflow
 
 

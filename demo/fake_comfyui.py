@@ -124,6 +124,9 @@ async def prompt(request: web.Request) -> web.Response:
                 complete_after = float(v)
     _jobs[prompt_id] = {
         "state": "running",
+        # Test-only simulation of an orchestrator worker: its active jobs
+        # appear in /mgpu/queue but not the primary ComfyUI /queue.
+        "worker_queue": _flagged("worker_queue"),
         "outputs": _default_outputs(),
         "hang": hang,
         "cached_nodes": cached_nodes,
@@ -188,7 +191,18 @@ async def debug_extra_data(request: web.Request) -> web.Response:
 
 
 async def queue(request: web.Request) -> web.Response:
-    running = [[0, pid] for pid, j in _jobs.items() if j["state"] == "running"]
+    running = [
+        [0, pid]
+        for pid, j in _jobs.items()
+        if j["state"] == "running" and not j["worker_queue"]
+    ]
+    return web.json_response({"queue_running": running, "queue_pending": []})
+
+
+async def mgpu_queue(request: web.Request) -> web.Response:
+    running = [
+        [0, pid] for pid, j in _jobs.items() if j["state"] == "running" and j["worker_queue"]
+    ]
     return web.json_response({"queue_running": running, "queue_pending": []})
 
 
@@ -302,6 +316,7 @@ def make_fake() -> web.Application:
             web.get("/history/{id}", history),
             web.get("/_debug/extra_data/{id}", debug_extra_data),
             web.get("/queue", queue),
+            web.get("/mgpu/queue", mgpu_queue),
             web.get("/view", view),
             web.post("/upload/image", upload_image),
             web.post("/api/jobs/{job_id}/cancel", cancel_job),

@@ -363,7 +363,9 @@ class Proxy:
                 return True
         return False
 
-    async def _status_of(self, job_id: str, base: str) -> dict[str, Any]:
+    async def _status_of(
+        self, job_id: str, base: str, worker_queue_cache: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         # 1) Terminal? history holds completed/failed jobs with their outputs.
         st, hist = await self._get_json(f"/history/{job_id}")
         if st == 200 and isinstance(hist, dict) and job_id in hist:
@@ -396,24 +398,44 @@ class Proxy:
         # 2) Not terminal: is it running or still queued?
         st, q = await self._get_json("/queue")
         if st == 200 and isinstance(q, dict):
-            running = {item[1] for item in q.get("queue_running", []) if len(item) > 1}
-            pending = [item[1] for item in q.get("queue_pending", []) if len(item) > 1]
-            if job_id in running:
-                return {
-                    "status": "running",
-                    "outputs": [],
-                    "progress": self._running_progress(),
-                    "outputs_reused": False,
-                }
-            if job_id in pending:
-                return {
-                    "status": "queued",
-                    "outputs": [],
-                    "queue_position": pending.index(job_id) + 1,
-                    "outputs_reused": False,
-                }
+            state = self._queue_status(job_id, q)
+            if state is not None:
+                return state
+            # Multi-GPU orchestrators route /prompt to workers. The primary
+            # /queue stays empty while those workers run; their aggregate queue
+            # is available separately. A missing endpoint (plain ComfyUI) is
+            # harmless, so only probe it for jobs absent from the native queue.
+            if worker_queue_cache is None or "queue" not in worker_queue_cache:
+                st, worker_queue = await self._get_json("/mgpu/queue")
+                if worker_queue_cache is not None:
+                    worker_queue_cache["queue"] = worker_queue if st == 200 else {}
+            else:
+                st, worker_queue = 200, worker_queue_cache["queue"]
+            if st == 200 and isinstance(worker_queue, dict):
+                state = self._queue_status(job_id, worker_queue)
+                if state is not None:
+                    return state
         # 3) Unknown to ComfyUI (never accepted, or evicted/restarted).
         return {"status": "unknown", "outputs": [], "outputs_reused": False}
+
+    def _queue_status(self, job_id: str, queue: dict[str, Any]) -> dict[str, Any] | None:
+        running = {item[1] for item in queue.get("queue_running", []) if len(item) > 1}
+        pending = [item[1] for item in queue.get("queue_pending", []) if len(item) > 1]
+        if job_id in running:
+            return {
+                "status": "running",
+                "outputs": [],
+                "progress": self._running_progress(),
+                "outputs_reused": False,
+            }
+        if job_id in pending:
+            return {
+                "status": "queued",
+                "outputs": [],
+                "queue_position": pending.index(job_id) + 1,
+                "outputs_reused": False,
+            }
+        return None
 
     def _running_progress(self) -> dict[str, Any]:
         # The poll path has no live step counter; report an indeterminate but
@@ -895,13 +917,14 @@ class Proxy:
             reverse=True,
         )
         jobs: list[dict[str, Any]] = []
+        worker_queue_cache: dict[str, Any] = {}
         scanned = 0
         for job_id in job_ids:
             if len(jobs) >= limit or scanned >= _MAX_JOB_SCAN:
                 break
             scanned += 1
             try:
-                state = await self._status_of(job_id, base)
+                state = await self._status_of(job_id, base, worker_queue_cache)
             except UpstreamUnreachable:
                 return _error(503, "upstream_unreachable", "Could not reach ComfyUI.")
             job = self._job(job_id, state, base)

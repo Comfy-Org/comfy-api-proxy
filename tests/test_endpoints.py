@@ -68,6 +68,28 @@ def test_job_and_output_urls_are_absolute(stack):
         assert out["url"].endswith("/content")
 
 
+def test_worker_queue_job_is_not_expired(stack):
+    workflow = {"1": {"class_type": "SaveImage", "inputs": {"worker_queue": True, "hang": True}}}
+    status, job, raw = stack.request("POST", "/api/v2/jobs", {"workflow": workflow})
+    assert status == 201, raw
+
+    # The primary queue and history do not contain an active worker job.
+    status, native_queue, _ = stack.request("GET", f"http://127.0.0.1:{stack.comfyui_port}/queue")
+    assert status == 200
+    assert all(item[1] != job["id"] for item in native_queue["queue_running"])
+    status, running, raw = stack.request("GET", job["urls"]["self"])
+    assert status == 200, raw
+    assert running["status"] == "running"
+
+    status, listing, raw = stack.request("GET", "/api/v2/jobs?status=running")
+    assert status == 200, raw
+    assert any(item["id"] == job["id"] for item in listing["jobs"])
+
+    status, canceled, raw = stack.request("POST", job["urls"]["cancel"])
+    assert status == 200, raw
+    assert canceled["status"] == "canceled"
+
+
 def test_upload_asset_returns_asset_shape(stack):
     import uuid as _uuid
 
