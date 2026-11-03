@@ -8,6 +8,7 @@ Stdlib-only HTTP (see conftest.Stack); no SDK, no third-party client.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
 import json
@@ -66,6 +67,28 @@ def test_job_and_output_urls_are_absolute(stack):
     for out in job["outputs"]:
         assert out["url"].startswith(f"{stack.base}/api/v2/assets/"), out["url"]
         assert out["url"].endswith("/content")
+
+
+def test_worker_queue_job_is_not_expired(stack):
+    workflow = {"1": {"class_type": "SaveImage", "inputs": {"worker_queue": True, "hang": True}}}
+    status, job, raw = stack.request("POST", "/api/v2/jobs", {"workflow": workflow})
+    assert status == 201, raw
+
+    # The primary queue and history do not contain an active worker job.
+    status, native_queue, _ = stack.request("GET", f"http://127.0.0.1:{stack.comfyui_port}/queue")
+    assert status == 200
+    assert all(item[1] != job["id"] for item in native_queue["queue_running"])
+    status, running, raw = stack.request("GET", job["urls"]["self"])
+    assert status == 200, raw
+    assert running["status"] == "running"
+
+    status, listing, raw = stack.request("GET", "/api/v2/jobs?status=running")
+    assert status == 200, raw
+    assert any(item["id"] == job["id"] for item in listing["jobs"])
+
+    status, canceled, raw = stack.request("POST", job["urls"]["cancel"])
+    assert status == 200, raw
+    assert canceled["status"] == "canceled"
 
 
 def test_upload_asset_returns_asset_shape(stack):
@@ -149,6 +172,34 @@ def test_upload_run_with_asset_ref_download(stack):
     status, _, content = stack.request("GET", job["outputs"][0]["url"])
     assert status == 200
     assert content.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_upload_run_with_short_asset_ref_download(stack):
+    _, asset, _ = stack.upload("cat.png", _PNG, "image/png", tags="input")
+    workflow = {
+        "1": {
+            "class_type": "LoadImage",
+            "inputs": {"image": f"asset:{asset['id']}"},
+        },
+        "9": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}},
+    }
+    status, job, raw = stack.request("POST", "/api/v2/jobs", {"workflow": workflow})
+    assert status == 201, raw
+    job = _poll_until_terminal(stack, job)
+    assert job["status"] == "succeeded", job.get("error")
+
+
+def test_unresolvable_short_asset_ref_rejected(stack):
+    workflow = {
+        "1": {
+            "class_type": "LoadImage",
+            "inputs": {"image": "asset:asset_ghost"},
+        }
+    }
+    status, body, raw = stack.request("POST", "/api/v2/jobs", {"workflow": workflow})
+    assert status == 422, raw
+    assert body["error"]["code"] == "missing_asset"
+    assert body["error"]["message"] == "Unresolvable asset reference(s): asset_ghost"
 
 
 def test_unresolvable_asset_ref_rejected(stack):
@@ -642,6 +693,41 @@ async def test_get_job_maps_upstream_unreachable_to_503_envelope():
         await proxy.on_cleanup(None)
 
 
+async def test_stalled_worker_queue_returns_upstream_unreachable(monkeypatch):
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer, make_mocked_request
+
+    from comfy_api_proxy import app as proxy_app
+
+    async def empty(request):
+        return web.json_response({})
+
+    async def native_queue(request):
+        return web.json_response({"queue_running": [], "queue_pending": []})
+
+    async def stalled_queue(request):
+        await asyncio.sleep(0.2)
+        return web.json_response({"queue_running": [], "queue_pending": []})
+
+    upstream = web.Application()
+    upstream.router.add_get("/history/{id}", empty)
+    upstream.router.add_get("/queue", native_queue)
+    upstream.router.add_get("/mgpu/queue", stalled_queue)
+    monkeypatch.setattr(proxy_app, "_WORKER_QUEUE_TIMEOUT", 0.02)
+
+    async with TestServer(upstream) as server:
+        proxy = proxy_app.Proxy(str(server.make_url("/")).rstrip("/"))
+        await proxy.on_startup(None)
+        try:
+            jid = "11111111-1111-1111-1111-111111111111"
+            req = make_mocked_request("GET", f"/api/v2/jobs/{jid}", match_info={"id": jid})
+            resp = await proxy.get_job(req)
+            assert resp.status == 503
+            assert json.loads(resp.body)["error"]["code"] == "upstream_unreachable"
+        finally:
+            await proxy.on_cleanup(None)
+
+
 def test_content_range_request(stack):
     _, asset, _ = stack.upload("cat.png", _PNG, "image/png")
     status, _, content = stack.request("GET", asset["url"], headers={"Range": "bytes=0-3"})
@@ -1072,25 +1158,31 @@ def test_range_request_returns_exact_slice_and_content_range_header(stack):
 
 # ---------------------------------------------------------------------------
 # Absolute-URL behavior: _external_base() (app.py) builds job/asset URLs from
-# request.scheme/request.host. make_app() wires no "trust the reverse proxy"
-# middleware, so those must reflect the connection the client actually used —
-# a client-supplied X-Forwarded-Host/-Proto must NOT be able to redirect the
-# URLs a caller is handed to an attacker-chosen origin.
+# request.scheme/request.host, while preserving the public HTTPS scheme when a
+# TLS terminator supplies X-Forwarded-Proto.
 # ---------------------------------------------------------------------------
-def test_absolute_urls_ignore_client_supplied_forwarded_headers(stack):
+def test_absolute_urls_preserve_forwarded_https_scheme(stack):
     workflow = {"9": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}}}
     status, job, raw = stack.request(
         "POST",
         "/api/v2/jobs",
         {"workflow": workflow},
-        headers={"X-Forwarded-Proto": "https", "X-Forwarded-Host": "evil.example"},
+        headers={"X-Forwarded-Proto": "https"},
     )
     assert status == 201, raw
-    assert job["urls"]["self"] == f"{stack.base}/api/v2/jobs/{job['id']}"
-    assert "evil.example" not in json.dumps(job["urls"])
-
-    _, asset, raw = stack.upload("cat.png", _PNG, "image/png")
-    assert asset["url"].startswith(stack.base + "/"), raw
+    assert job["urls"]["self"] == f"https://127.0.0.1:{stack.proxy_port}/api/v2/jobs/{job['id']}"
+    deadline = time.monotonic() + 15
+    while job["status"] not in _TERMINAL:
+        assert time.monotonic() < deadline
+        time.sleep(0.1)
+        status, job, raw = stack.request(
+            "GET",
+            f"/api/v2/jobs/{job['id']}",
+            headers={"X-Forwarded-Proto": "https"},
+        )
+        assert status == 200, raw
+    assert job["outputs"], job
+    assert job["outputs"][0]["url"].startswith(f"https://127.0.0.1:{stack.proxy_port}/")
 
 
 # ---------------------------------------------------------------------------

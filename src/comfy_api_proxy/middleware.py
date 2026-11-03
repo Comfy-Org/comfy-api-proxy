@@ -46,6 +46,7 @@ preflight ``OPTIONS`` and on ``GET /api/v2/health``).
 from __future__ import annotations
 
 import ipaddress
+import re
 import socket
 import urllib.parse
 from collections.abc import Collection
@@ -55,6 +56,7 @@ from aiohttp.typedefs import Handler, Middleware
 
 # Stashed on the request by CORS middleware; read by on_response_prepare.
 _CORS_ORIGIN_KEY = "cors_allowed_origin"
+_ASSET_CONTENT_PATH = re.compile(r"/api/v2/assets/[^/]+/content")
 
 CORS_ALLOW_METHODS = "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"
 CORS_ALLOW_HEADERS = "Authorization, Content-Type, Idempotency-Key"
@@ -195,7 +197,9 @@ def attach_cors_prepare(app: web.Application) -> None:
     app.on_response_prepare.append(_on_prepare)
 
 
-def make_origin_only_middleware(allowed_origins: Collection[str] = ()) -> Middleware:
+def make_origin_only_middleware(
+    allowed_origins: Collection[str] = (), *, asset_skip_auth_header: bool = False
+) -> Middleware:
     """Build the default-on origin guard, with optional allowlist bypass.
 
     Origins in ``allowed_origins`` skip both the ``Sec-Fetch-Site`` and the
@@ -210,6 +214,17 @@ def make_origin_only_middleware(allowed_origins: Collection[str] = ()) -> Middle
         if origin_header and origin_header in allowed:
             if request.method == "OPTIONS":
                 return web.Response(status=204)
+            return await handler(request)
+
+        # Browser image/media requests commonly use `no-cors` and omit Origin,
+        # while still sending Sec-Fetch-Site: cross-site. When asset content is
+        # explicitly configured as bearer-by-URL, let those requests reach the
+        # handler; the URL itself is the access credential in that mode.
+        if (
+            asset_skip_auth_header
+            and request.method in ("GET", "HEAD")
+            and _ASSET_CONTENT_PATH.fullmatch(request.path)
+        ):
             return await handler(request)
 
         if request.headers.get("Sec-Fetch-Site") == "cross-site":

@@ -14,6 +14,7 @@ the bind address, which is exactly when ``cli.py`` requires one to be set.
 from __future__ import annotations
 
 import hmac
+import re
 
 from aiohttp import web
 from aiohttp.typedefs import Handler, Middleware
@@ -26,10 +27,13 @@ def _forbidden(code: str, message: str) -> web.Response:
     )
 
 
-def make_bearer_auth_middleware(token: str) -> Middleware:
+_ASSET_CONTENT_PATH = re.compile(r"/api/v2/assets/[^/]+/content")
+
+
+def make_bearer_auth_middleware(token: str, *, asset_skip_auth_header: bool = False) -> Middleware:
     """Build a middleware requiring ``Authorization: Bearer <token>`` on
-    every ``/api/v2/*`` request (except ``GET /api/v2/health``), constant-time
-    compared against ``token``.
+    ``/api/v2/*`` requests (except health and, when enabled, asset content
+    downloads), constant-time compared against ``token``.
     """
 
     @web.middleware
@@ -42,6 +46,12 @@ def make_bearer_auth_middleware(token: str) -> Middleware:
         # Browser CORS preflight never carries Authorization; allow OPTIONS
         # through so an allowlisted origin can negotiate before the real call.
         if request.method == "OPTIONS":
+            return await handler(request)
+        if (
+            asset_skip_auth_header
+            and request.method in ("GET", "HEAD")
+            and _ASSET_CONTENT_PATH.fullmatch(request.path)
+        ):
             return await handler(request)
         header = request.headers.get("Authorization", "")
         scheme, _, presented = header.partition(" ")

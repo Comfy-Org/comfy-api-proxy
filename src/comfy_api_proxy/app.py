@@ -76,6 +76,22 @@ _DEFAULT_MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 _MAX_CONCURRENT_STREAMS = 8
 
 _RETENTION = timedelta(hours=24)
+_WORKER_QUEUE_TIMEOUT = 10  # seconds; a stalled optional endpoint must not block job polling
+
+
+def _generated_upload_filename(filename: str | None, content_type: str) -> str:
+    """Generate a UUID filename while preserving a known file extension."""
+    extension = ""
+    if filename:
+        # Multipart filenames may contain either POSIX or Windows separators.
+        basename = filename.replace("\\", "/").rsplit("/", 1)[-1]
+        suffix = Path(basename).suffix
+        if suffix and suffix[1:].isalnum():
+            extension = suffix.lower()
+    if not extension and content_type:
+        extension = mimetypes.guess_extension(content_type.split(";", 1)[0].strip()) or ""
+    return f"{uuid.uuid4()}{extension}"
+
 
 # Idempotency-Key bounds. A per-instance self-hosted proxy holds claimed keys
 # in memory, so cap both the length of any single key and the total number
@@ -119,13 +135,17 @@ def _iso(dt: datetime) -> str:
 
 def _external_base(request: web.Request) -> str:
     """The absolute base URL clients reached us on, from the request's scheme and
-    Host header. Content and job links are built from this so the contract's
+    Host header. When TLS is terminated by a reverse proxy, use its validated
+    ``X-Forwarded-Proto`` value so generated links keep the public ``https``
+    scheme. Content and job links are built from this so the contract's
     absolute-URI fields (Output.url / Asset.url) are actually absolute — and so a
-    client on http://host:port follows links back to the same origin. No
-    X-Forwarded-* handling is wired, so those headers are ignored (a client can't
-    point the emitted links at another origin); front this with a TLS terminator
-    only if you add explicit forwarded-header trust."""
-    return f"{request.scheme}://{request.host}"
+    client on http://host:port follows links back to the same origin. The proxy
+    deployment must overwrite, rather than append to, this header at the TLS
+    terminator; otherwise a direct client could influence the generated scheme."""
+    scheme = request.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip().lower()
+    if scheme not in {"http", "https"}:
+        scheme = request.scheme
+    return f"{scheme}://{request.host}"
 
 
 def _b64url_decode(s: str) -> bytes:
@@ -320,11 +340,16 @@ class Proxy:
         return None
 
     # -- upstream helpers ----------------------------------------------------
-    async def _get_json(self, path: str) -> tuple[int, Any]:
-        try:
+    async def _get_json(self, path: str, *, timeout: float | None = None) -> tuple[int, Any]:
+        async def fetch() -> tuple[int, Any]:
             async with self.session.get(self.comfyui + path) as r:
                 body = await r.json() if r.content_type == "application/json" else await r.text()
                 return r.status, body
+
+        try:
+            if timeout is not None:
+                return await asyncio.wait_for(fetch(), timeout)
+            return await fetch()
         except (ClientError, asyncio.TimeoutError) as e:
             raise UpstreamUnreachable(str(e)) from e
 
@@ -345,7 +370,9 @@ class Proxy:
                 return True
         return False
 
-    async def _status_of(self, job_id: str, base: str) -> dict[str, Any]:
+    async def _status_of(
+        self, job_id: str, base: str, worker_queue_cache: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         # 1) Terminal? history holds completed/failed jobs with their outputs.
         st, hist = await self._get_json(f"/history/{job_id}")
         if st == 200 and isinstance(hist, dict) and job_id in hist:
@@ -378,24 +405,46 @@ class Proxy:
         # 2) Not terminal: is it running or still queued?
         st, q = await self._get_json("/queue")
         if st == 200 and isinstance(q, dict):
-            running = {item[1] for item in q.get("queue_running", []) if len(item) > 1}
-            pending = [item[1] for item in q.get("queue_pending", []) if len(item) > 1]
-            if job_id in running:
-                return {
-                    "status": "running",
-                    "outputs": [],
-                    "progress": self._running_progress(),
-                    "outputs_reused": False,
-                }
-            if job_id in pending:
-                return {
-                    "status": "queued",
-                    "outputs": [],
-                    "queue_position": pending.index(job_id) + 1,
-                    "outputs_reused": False,
-                }
+            state = self._queue_status(job_id, q)
+            if state is not None:
+                return state
+            # Multi-GPU orchestrators route /prompt to workers. The primary
+            # /queue stays empty while those workers run; their aggregate queue
+            # is available separately. A missing endpoint (plain ComfyUI) is
+            # harmless, so only probe it for jobs absent from the native queue.
+            if worker_queue_cache is None or "queue" not in worker_queue_cache:
+                st, worker_queue = await self._get_json(
+                    "/mgpu/queue", timeout=_WORKER_QUEUE_TIMEOUT
+                )
+                if worker_queue_cache is not None:
+                    worker_queue_cache["queue"] = worker_queue if st == 200 else {}
+            else:
+                st, worker_queue = 200, worker_queue_cache["queue"]
+            if st == 200 and isinstance(worker_queue, dict):
+                state = self._queue_status(job_id, worker_queue)
+                if state is not None:
+                    return state
         # 3) Unknown to ComfyUI (never accepted, or evicted/restarted).
         return {"status": "unknown", "outputs": [], "outputs_reused": False}
+
+    def _queue_status(self, job_id: str, queue: dict[str, Any]) -> dict[str, Any] | None:
+        running = {item[1] for item in queue.get("queue_running", []) if len(item) > 1}
+        pending = [item[1] for item in queue.get("queue_pending", []) if len(item) > 1]
+        if job_id in running:
+            return {
+                "status": "running",
+                "outputs": [],
+                "progress": self._running_progress(),
+                "outputs_reused": False,
+            }
+        if job_id in pending:
+            return {
+                "status": "queued",
+                "outputs": [],
+                "queue_position": pending.index(job_id) + 1,
+                "outputs_reused": False,
+            }
+        return None
 
     def _running_progress(self) -> dict[str, Any]:
         # The poll path has no live step counter; report an indeterminate but
@@ -601,8 +650,13 @@ class Proxy:
         return record.file_path
 
     def _rewrite_asset_refs(self, node: Any, missing: list[str]) -> Any:
-        """Recursively replace core/ASSET refs in a workflow with the
-        filename string ComfyUI expects, collecting unresolvable ids."""
+        """Recursively replace asset refs with the filename ComfyUI expects.
+
+        ``core/ASSET`` remains supported for compatibility.  ``LoadImage``
+        also accepts the shorter ``asset:<id>`` string form on its ``image``
+        input; the special handling is deliberately limited to that node and
+        field so ordinary text values elsewhere in a workflow are untouched.
+        """
         if _is_asset_ref(node):
             info = node.get("info")
             if not isinstance(info, dict):
@@ -616,7 +670,24 @@ class Proxy:
                 return node
             return resolved
         if isinstance(node, dict):
-            return {k: self._rewrite_asset_refs(v, missing) for k, v in node.items()}
+            rewritten: dict[str, Any] = {}
+            is_load_image = node.get("class_type") == "LoadImage"
+            inputs = node.get("inputs")
+            for key, value in node.items():
+                if is_load_image and key == "inputs" and isinstance(inputs, dict):
+                    rewritten_inputs = dict(inputs)
+                    image = inputs.get("image")
+                    if isinstance(image, str) and image.startswith("asset:"):
+                        asset_id = image.removeprefix("asset:")
+                        resolved = self._resolve_asset_ref({"id": asset_id}) if asset_id else None
+                        if resolved is None:
+                            missing.append(asset_id or "<empty asset reference>")
+                        else:
+                            rewritten_inputs["image"] = resolved
+                    rewritten[key] = self._rewrite_asset_refs(rewritten_inputs, missing)
+                else:
+                    rewritten[key] = self._rewrite_asset_refs(value, missing)
+            return rewritten
         if isinstance(node, list):
             return [self._rewrite_asset_refs(v, missing) for v in node]
         return node
@@ -725,7 +796,7 @@ class Proxy:
             return _error(
                 422,
                 "missing_asset",
-                f"Unresolvable core/ASSET reference(s): {', '.join(missing)}",
+                f"Unresolvable asset reference(s): {', '.join(missing)}",
                 missing_ids=missing,
             )
 
@@ -853,13 +924,14 @@ class Proxy:
             reverse=True,
         )
         jobs: list[dict[str, Any]] = []
+        worker_queue_cache: dict[str, Any] = {}
         scanned = 0
         for job_id in job_ids:
             if len(jobs) >= limit or scanned >= _MAX_JOB_SCAN:
                 break
             scanned += 1
             try:
-                state = await self._status_of(job_id, base)
+                state = await self._status_of(job_id, base, worker_queue_cache)
             except UpstreamUnreachable:
                 return _error(503, "upstream_unreachable", "Could not reach ComfyUI.")
             job = self._job(job_id, state, base)
@@ -1010,6 +1082,7 @@ class Proxy:
         size = 0
         digest = blake3.blake3()
         part_content_type = "application/octet-stream"
+        upload_filename: str | None = None
         expires_in: int | None = None
 
         try:
@@ -1026,6 +1099,7 @@ class Proxy:
                     continue
                 if part.name == "file":
                     part_content_type = part.headers.get("Content-Type", part_content_type)
+                    upload_filename = part.filename
                     fd, tmp_path = tempfile.mkstemp(prefix="comfy-upload-")
                     with os.fdopen(fd, "wb") as f:
                         while True:
@@ -1055,7 +1129,9 @@ class Proxy:
                 return _error(422, "invalid_request", "Missing 'file' part.")
             file_path = fields.get("file_path")
             if not file_path:
-                return _error(422, "invalid_request", "Missing 'file_path'.")
+                file_path = _generated_upload_filename(
+                    upload_filename, fields.get("content_type") or part_content_type
+                )
             # Validate + classify the path ONCE, before deciding which branch
             # handles it (model-directory placement vs. plain input upload).
             # This must happen before that decision, not after: a path like

@@ -1,7 +1,7 @@
 """Upload validation paths that the happy-path `stack.upload` helper skips.
 
 `Stack.upload` always sends a well-formed multipart body (file + file_path +
-content_type), so the missing-part branches and the streaming size cap have no
+content_type), so the missing-file branch and the streaming size cap have no
 coverage. These build the multipart body by hand to omit parts / exceed the cap.
 """
 
@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import urllib.error
 import urllib.request
+import uuid
+from pathlib import Path
 
 BOUNDARY = "----comfyproxytestVALIDATION"
 
@@ -59,10 +61,11 @@ def test_upload_missing_file_part_rejected(stack):
     assert body["error"]["code"] == "invalid_request"
 
 
-def test_upload_missing_file_path_field_rejected(stack):
+def test_upload_without_file_path_gets_generated_name(stack):
     status, body = _post_multipart(stack.base, include_file_path=False)
-    assert status == 422, body
-    assert body["error"]["code"] == "invalid_request"
+    assert status == 201, body
+    assert body["file_path"].endswith(".png"), body
+    uuid.UUID(Path(body["file_path"]).stem)
 
 
 def test_upload_exceeding_max_bytes_rejected(stack_small_upload):

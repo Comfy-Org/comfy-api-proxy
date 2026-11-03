@@ -81,6 +81,12 @@ def _add_server_args(parser: argparse.ArgumentParser) -> None:
         help="Require 'Authorization: Bearer <token>' on /api/v2/* requests.",
     )
     parser.add_argument(
+        "--asset-skip-auth-header",
+        action="store_true",
+        help="With --token, allow GET/HEAD /api/v2/assets/{id}/content without "
+        "Authorization. Anyone with an asset URL can download its content.",
+    )
+    parser.add_argument(
         "--comfyui-base-dir",
         default=None,
         help="Filesystem root of the co-located ComfyUI install. Required to "
@@ -152,9 +158,17 @@ def _run_foreground(args: argparse.Namespace) -> int:
     middlewares: list = []
     if cors_origins:
         middlewares.append(make_cors_middleware(cors_origins))
-    middlewares.append(make_origin_only_middleware(cors_origins))
+    middlewares.append(
+        make_origin_only_middleware(
+            cors_origins, asset_skip_auth_header=args.asset_skip_auth_header
+        )
+    )
     if args.token:
-        middlewares.append(make_bearer_auth_middleware(args.token))
+        middlewares.append(
+            make_bearer_auth_middleware(
+                args.token, asset_skip_auth_header=args.asset_skip_auth_header
+            )
+        )
 
     app = make_app(
         args.comfyui,
@@ -183,6 +197,8 @@ def _server_argv(args: argparse.Namespace) -> list[str]:
     ]
     if args.token:
         argv += ["--token", args.token]
+    if args.asset_skip_auth_header:
+        argv += ["--asset-skip-auth-header"]
     if args.comfyui_base_dir:
         argv += ["--comfyui-base-dir", args.comfyui_base_dir]
     if args.allow_insecure_bind:

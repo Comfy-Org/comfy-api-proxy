@@ -173,6 +173,7 @@ def _make_stack(
     *,
     comfyui_base_dir: str | None = None,
     token: str | None = None,
+    asset_skip_auth_header: bool = False,
     max_upload_mb: int | None = None,
     state_dir: str | None = None,
     comfyui_port: int | None = None,
@@ -219,6 +220,8 @@ def _make_stack(
         proxy_args += ["--comfyui-base-dir", comfyui_base_dir]
     if token is not None:
         proxy_args += ["--token", token]
+    if asset_skip_auth_header:
+        proxy_args += ["--asset-skip-auth-header"]
     if max_upload_mb is not None:
         proxy_args += ["--max-upload-mb", str(max_upload_mb)]
     if state_dir is not None:

@@ -86,7 +86,6 @@ paths:
               required:
               - file
               - content_type
-              - file_path
               properties:
                 file:
                   type: string
@@ -97,8 +96,9 @@ paths:
                   example: image/png
                 file_path:
                   type: string
-                  description: Placement path / filename (global-namespace-root form, e.g.
-                    `photo.png` or `models/checkpoints/x.safetensors`).
+                  description: Optional placement path / filename (global-namespace-root form, e.g.
+                    `photo.png` or `models/checkpoints/x.safetensors`). If omitted, the server
+                    generates a UUID filename and preserves or infers the file extension.
                   example: photo.png
                 expected_hash:
                   type: string

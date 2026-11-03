@@ -8,10 +8,14 @@ check that the CLI actually installs the gate on the live proxy.
 
 from __future__ import annotations
 
+import time
+
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 
 from comfy_api_proxy.auth import make_bearer_auth_middleware
+from comfy_api_proxy.cli import main
+from comfy_api_proxy.middleware import make_origin_only_middleware
 
 
 async def _invoke(mw, headers, path="/api/v2/jobs/x"):
@@ -56,6 +60,48 @@ async def test_correct_token_allows_request():
     assert ran
 
 
+async def test_asset_content_auth_exception_is_opt_in_and_exact():
+    content = "/api/v2/assets/asset-id/content"
+    resp, ran = await _invoke(make_bearer_auth_middleware("secret"), {}, path=content)
+    assert resp.status == 401
+    assert not ran
+
+    mw = make_bearer_auth_middleware("secret", asset_skip_auth_header=True)
+    for headers in ({}, {"Authorization": "Bearer wrong"}):
+        resp, ran = await _invoke(mw, headers, path=content)
+        assert resp.status == 200
+        assert ran
+
+    for path in (
+        "/api/v2/assets/asset-id",
+        "/api/v2/assets/asset-id/content/extra",
+        "/api/v2/assets/asset-id/contentful",
+        "/api/v2/assets//content",
+        "/api/v2/jobs/asset-id/content",
+    ):
+        resp, ran = await _invoke(mw, {}, path=path)
+        assert resp.status == 401, path
+        assert not ran
+
+
+async def test_asset_content_skip_auth_allows_cross_site_image_request():
+    mw = make_origin_only_middleware((), asset_skip_auth_header=True)
+    request = make_mocked_request(
+        "GET",
+        "/api/v2/assets/asset-id/content",
+        headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Dest": "image"},
+    )
+    called = {"v": False}
+
+    async def handler(_req):
+        called["v"] = True
+        return web.Response(status=200)
+
+    resp = await mw(request, handler)
+    assert resp.status == 200
+    assert called["v"]
+
+
 async def test_non_v2_path_bypasses_the_gate():
     # The gate only guards /api/v2/*; a health/other path passes through with
     # no Authorization header.
@@ -98,6 +144,56 @@ def test_token_gate_enforced_end_to_end(stack_with_token):
         "GET", f"/api/v2/jobs/{jid}", headers={"Authorization": "Bearer secret"}
     )
     assert authed != 401  # past the gate (404 for the unknown job id is fine)
+
+
+def test_asset_content_skip_auth_header_end_to_end(make_stack, tmp_path):
+    stack, cleanup = make_stack(tmp_path, token="secret", asset_skip_auth_header=True)
+    try:
+        workflow = {"9": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}}}
+        status, job, raw = stack.request(
+            "POST",
+            "/api/v2/jobs",
+            {"workflow": workflow},
+            headers={"Authorization": "Bearer secret"},
+        )
+        assert status == 201, raw
+        deadline = time.monotonic() + 15
+        while job["status"] not in ("succeeded", "failed"):
+            assert time.monotonic() < deadline
+            time.sleep(0.1)
+            status, job, raw = stack.request(
+                "GET", job["urls"]["self"], headers={"Authorization": "Bearer secret"}
+            )
+            assert status == 200, raw
+        assert job["status"] == "succeeded"
+        url = job["outputs"][0]["url"]
+        asset_id = job["outputs"][0]["id"]
+
+        status, _, content = stack.request("GET", url)
+        assert status == 200
+        assert content.startswith(b"\x89PNG\r\n\x1a\n")
+        status, _, _ = stack.request("GET", url, headers={"Authorization": "Bearer wrong"})
+        assert status == 200
+        status, _, _ = stack.request("HEAD", url)
+        assert status == 200
+        status, body, _ = stack.request("GET", f"/api/v2/assets/{asset_id}")
+        assert status == 401, body
+        status, body, _ = stack.request("POST", "/api/v2/jobs", {"workflow": workflow})
+        assert status == 401, body
+    finally:
+        cleanup()
+
+
+def test_background_start_passes_asset_auth_flag(monkeypatch):
+    captured = {}
+
+    def start(argv, host, port):
+        captured["argv"] = argv
+        return 0
+
+    monkeypatch.setattr("comfy_api_proxy.cli.service.start", start)
+    assert main(["start", "--token", "secret", "--asset-skip-auth-header"]) == 0
+    assert "--asset-skip-auth-header" in captured["argv"]
 
 
 def test_unauthenticated_by_default_when_no_token_configured(stack):
