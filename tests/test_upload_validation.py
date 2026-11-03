@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import urllib.error
 import urllib.request
+import uuid
+from pathlib import Path
 
 BOUNDARY = "----comfyproxytestVALIDATION"
 
@@ -63,7 +65,7 @@ def test_upload_without_file_path_gets_generated_name(stack):
     status, body = _post_multipart(stack.base, include_file_path=False)
     assert status == 201, body
     assert body["file_path"].endswith(".png"), body
-    assert len(body["file_path"]) == 40, body
+    uuid.UUID(Path(body["file_path"]).stem)
 
 
 def test_upload_exceeding_max_bytes_rejected(stack_small_upload):

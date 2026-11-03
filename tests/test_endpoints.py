@@ -8,6 +8,7 @@ Stdlib-only HTTP (see conftest.Stack); no SDK, no third-party client.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
 import json
@@ -198,6 +199,7 @@ def test_unresolvable_short_asset_ref_rejected(stack):
     status, body, raw = stack.request("POST", "/api/v2/jobs", {"workflow": workflow})
     assert status == 422, raw
     assert body["error"]["code"] == "missing_asset"
+    assert body["error"]["message"] == "Unresolvable asset reference(s): asset_ghost"
 
 
 def test_unresolvable_asset_ref_rejected(stack):
@@ -691,6 +693,41 @@ async def test_get_job_maps_upstream_unreachable_to_503_envelope():
         await proxy.on_cleanup(None)
 
 
+async def test_stalled_worker_queue_returns_upstream_unreachable(monkeypatch):
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer, make_mocked_request
+
+    from comfy_api_proxy import app as proxy_app
+
+    async def empty(request):
+        return web.json_response({})
+
+    async def native_queue(request):
+        return web.json_response({"queue_running": [], "queue_pending": []})
+
+    async def stalled_queue(request):
+        await asyncio.sleep(0.2)
+        return web.json_response({"queue_running": [], "queue_pending": []})
+
+    upstream = web.Application()
+    upstream.router.add_get("/history/{id}", empty)
+    upstream.router.add_get("/queue", native_queue)
+    upstream.router.add_get("/mgpu/queue", stalled_queue)
+    monkeypatch.setattr(proxy_app, "_WORKER_QUEUE_TIMEOUT", 0.02)
+
+    async with TestServer(upstream) as server:
+        proxy = proxy_app.Proxy(str(server.make_url("/")).rstrip("/"))
+        await proxy.on_startup(None)
+        try:
+            jid = "11111111-1111-1111-1111-111111111111"
+            req = make_mocked_request("GET", f"/api/v2/jobs/{jid}", match_info={"id": jid})
+            resp = await proxy.get_job(req)
+            assert resp.status == 503
+            assert json.loads(resp.body)["error"]["code"] == "upstream_unreachable"
+        finally:
+            await proxy.on_cleanup(None)
+
+
 def test_content_range_request(stack):
     _, asset, _ = stack.upload("cat.png", _PNG, "image/png")
     status, _, content = stack.request("GET", asset["url"], headers={"Range": "bytes=0-3"})
@@ -1145,9 +1182,7 @@ def test_absolute_urls_preserve_forwarded_https_scheme(stack):
         )
         assert status == 200, raw
     assert job["outputs"], job
-    assert job["outputs"][0]["url"].startswith(
-        f"https://127.0.0.1:{stack.proxy_port}/"
-    )
+    assert job["outputs"][0]["url"].startswith(f"https://127.0.0.1:{stack.proxy_port}/")
 
 
 # ---------------------------------------------------------------------------

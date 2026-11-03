@@ -151,7 +151,10 @@ def test_asset_content_skip_auth_header_end_to_end(make_stack, tmp_path):
     try:
         workflow = {"9": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}}}
         status, job, raw = stack.request(
-            "POST", "/api/v2/jobs", {"workflow": workflow}, headers={"Authorization": "Bearer secret"}
+            "POST",
+            "/api/v2/jobs",
+            {"workflow": workflow},
+            headers={"Authorization": "Bearer secret"},
         )
         assert status == 201, raw
         deadline = time.monotonic() + 15

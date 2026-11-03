@@ -165,7 +165,9 @@ def _run_foreground(args: argparse.Namespace) -> int:
     )
     if args.token:
         middlewares.append(
-            make_bearer_auth_middleware(args.token, asset_skip_auth_header=args.asset_skip_auth_header)
+            make_bearer_auth_middleware(
+                args.token, asset_skip_auth_header=args.asset_skip_auth_header
+            )
         )
 
     app = make_app(

@@ -76,6 +76,7 @@ _DEFAULT_MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 _MAX_CONCURRENT_STREAMS = 8
 
 _RETENTION = timedelta(hours=24)
+_WORKER_QUEUE_TIMEOUT = 10  # seconds; a stalled optional endpoint must not block job polling
 
 
 def _generated_upload_filename(filename: str | None, content_type: str) -> str:
@@ -90,6 +91,7 @@ def _generated_upload_filename(filename: str | None, content_type: str) -> str:
     if not extension and content_type:
         extension = mimetypes.guess_extension(content_type.split(";", 1)[0].strip()) or ""
     return f"{uuid.uuid4()}{extension}"
+
 
 # Idempotency-Key bounds. A per-instance self-hosted proxy holds claimed keys
 # in memory, so cap both the length of any single key and the total number
@@ -338,11 +340,16 @@ class Proxy:
         return None
 
     # -- upstream helpers ----------------------------------------------------
-    async def _get_json(self, path: str) -> tuple[int, Any]:
-        try:
+    async def _get_json(self, path: str, *, timeout: float | None = None) -> tuple[int, Any]:
+        async def fetch() -> tuple[int, Any]:
             async with self.session.get(self.comfyui + path) as r:
                 body = await r.json() if r.content_type == "application/json" else await r.text()
                 return r.status, body
+
+        try:
+            if timeout is not None:
+                return await asyncio.wait_for(fetch(), timeout)
+            return await fetch()
         except (ClientError, asyncio.TimeoutError) as e:
             raise UpstreamUnreachable(str(e)) from e
 
@@ -406,7 +413,9 @@ class Proxy:
             # is available separately. A missing endpoint (plain ComfyUI) is
             # harmless, so only probe it for jobs absent from the native queue.
             if worker_queue_cache is None or "queue" not in worker_queue_cache:
-                st, worker_queue = await self._get_json("/mgpu/queue")
+                st, worker_queue = await self._get_json(
+                    "/mgpu/queue", timeout=_WORKER_QUEUE_TIMEOUT
+                )
                 if worker_queue_cache is not None:
                     worker_queue_cache["queue"] = worker_queue if st == 200 else {}
             else:
@@ -670,9 +679,7 @@ class Proxy:
                     image = inputs.get("image")
                     if isinstance(image, str) and image.startswith("asset:"):
                         asset_id = image.removeprefix("asset:")
-                        resolved = (
-                            self._resolve_asset_ref({"id": asset_id}) if asset_id else None
-                        )
+                        resolved = self._resolve_asset_ref({"id": asset_id}) if asset_id else None
                         if resolved is None:
                             missing.append(asset_id or "<empty asset reference>")
                         else:
@@ -789,7 +796,7 @@ class Proxy:
             return _error(
                 422,
                 "missing_asset",
-                f"Unresolvable core/ASSET reference(s): {', '.join(missing)}",
+                f"Unresolvable asset reference(s): {', '.join(missing)}",
                 missing_ids=missing,
             )
 
