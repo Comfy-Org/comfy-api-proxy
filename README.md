@@ -11,6 +11,12 @@
 
 </div>
 
+> **Deprecated.** ComfyUI core now serves `/api/v2` natively when started with
+> `--enable-assets`. Point your SDKs at `COMFY_BASE_URL=http://127.0.0.1:8188`
+> (or your ComfyUI `--listen`/`--port`). This proxy receives no new contract
+> updates; existing releases stay installable. See
+> [Migrating to ComfyUI core](docs/migrating-to-comfyui-core.md).
+
 <p align="center">
   <a href="https://pypi.org/project/comfy-api-proxy/"><img src="https://img.shields.io/pypi/v/comfy-api-proxy?style=for-the-badge&logo=pypi&logoColor=white&label=PyPI" alt="PyPI"></a>
   <a href="#requirements--install"><img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.10+"></a>
@@ -289,6 +295,9 @@ a regeneration gets caught immediately instead of drifting silently. See
 `spec/README.md` and `docs/sync-workflow.md` for the full design.
 
 ## Scope
+
+This proxy is deprecated in favour of ComfyUI core's native `/api/v2`; see
+[Migrating to ComfyUI core](docs/migrating-to-comfyui-core.md).
 
 Implemented: submit (with `core/ASSET` resolution), poll, cancel, live SSE
 events, asset upload/download, from-hash/by-hash dedup, guarded
